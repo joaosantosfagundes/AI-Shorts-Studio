@@ -1,0 +1,13 @@
+diff --git a/backend/autoclip/pipeline/reframe/faces.py b/backend/autoclip/pipeline/reframe/faces.py
+--- a/backend/autoclip/pipeline/reframe/faces.py
++++ b/backend/autoclip/pipeline/reframe/faces.py
+@@ -115,7 +115,8 @@ def sample_faces(
+     model_file = models.ensure("face_landmarker")
+ 
+     options = FaceLandmarkerOptions(
+-        base_options=BaseOptions(model_asset_path=str(model_file)),
++        # Let Python open the file so Unicode Windows paths work with the native task.
++        base_options=BaseOptions(model_asset_buffer=model_file.read_bytes()),
+         running_mode=RunningMode.VIDEO,
+         num_faces=max_faces,
+         min_face_detection_confidence=0.4,
