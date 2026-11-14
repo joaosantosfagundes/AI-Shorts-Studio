@@ -70,18 +70,25 @@ if (-not (Test-Path -LiteralPath $autoclipRoot)) {
     Move-Item -LiteralPath (Join-Path $downloads "Autoclip-$commit") -Destination $autoclipRoot
 }
 
-$mediaPipePatch = Join-Path $PSScriptRoot 'autoclip-windows-mediapipe.patch'
-$previousErrorPreference = $ErrorActionPreference
-try {
-    $ErrorActionPreference = 'Continue'
-    & git.exe -C $autoclipRoot apply --reverse --check $mediaPipePatch 2>$null
-    $patchApplied = $LASTEXITCODE -eq 0
-} finally {
-    $ErrorActionPreference = $previousErrorPreference
-}
-if (-not $patchApplied) {
-    & git.exe -C $autoclipRoot apply $mediaPipePatch
-    Assert-ExitCode 'Correção de caminhos Unicode no MediaPipe'
+foreach ($patchName in @('autoclip-windows-mediapipe.patch', 'autoclip-performance.patch')) {
+    $patch = Join-Path $PSScriptRoot $patchName
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        # The installed snapshot lives inside the outer project repository.
+        # Explicitly prevent Git from using the outer worktree for apply.
+        $gitScope = @('-C', $autoclipRoot, "--git-dir=$autoclipRoot/.git-patch", "--work-tree=$autoclipRoot")
+        & git.exe @gitScope apply --reverse --check $patch 2>$null
+        $patchApplied = $LASTEXITCODE -eq 0
+        if (-not $patchApplied) {
+            & git.exe @gitScope apply --check $patch
+            Assert-ExitCode "Verificação de $patchName"
+            & git.exe @gitScope apply $patch
+            Assert-ExitCode "Aplicação de $patchName"
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
 }
 
 if (-not (Test-Path -LiteralPath $pythonExe)) {
@@ -115,7 +122,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 Copy-Item -LiteralPath (Join-Path $autoclipRoot 'LICENSE') -Destination (Join-Path $staticRoot 'LICENSE-AutoClip.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'licencas/fontes') -Destination $staticRoot -Recurse -Force
 
-& $pythonExe -c 'from faster_whisper.utils import download_model; print(download_model("base"))'
+& $pythonExe -c "from faster_whisper.utils import download_model; download_model('base')"
 Assert-ExitCode 'Download do Whisper base'
 
 $panelData = $env:AUTOCLIP_HOME
@@ -127,7 +134,6 @@ try {
     $env:AUTOCLIP_HOME = $panelData
 }
 
-$env:CUDA_VISIBLE_DEVICES = '-1'
 & $autoClipExe doctor
 Assert-ExitCode 'Diagnóstico do AutoClip'
 Write-Host 'Instalação concluída. Execute scripts/iniciar-fase1.ps1 para iniciar o painel e preparar o modelo Ollama.'

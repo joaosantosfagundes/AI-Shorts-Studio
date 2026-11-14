@@ -1,8 +1,13 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿param([switch]$Rapido, [switch]$NVENC)
+
+$ErrorActionPreference = 'Stop'
 
 # A projeção WinRT do Windows PowerShell dá acesso às vozes pt-BR do sistema.
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
-    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+    $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    if ($Rapido) { $childArgs += '-Rapido' }
+    if ($NVENC) { $childArgs += '-NVENC' }
+    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @childArgs
     exit $LASTEXITCODE
 }
 
@@ -131,28 +136,28 @@ if ([double]::Parse($sourceProbe.format.duration, [cultureinfo]::InvariantCultur
     throw 'A gravação sintética precisa ter pelo menos 40 segundos.'
 }
 
+$resolution = if ($Rapido) { '720p' } else { '1080p' }
+$width = if ($Rapido) { 720 } else { 1080 }
+$height = if ($Rapido) { 1280 } else { 1920 }
 $testConfig = @{
     active_provider = 'ollama'
     providers = @{ ollama = @{ model = $phaseModel; base_url = $ollamaUrl } }
-    whisper = @{ model = 'base'; compute_type = 'int8'; language = $language; diarization = $false }
+    whisper = @{ model = 'base'; device = 'cpu'; compute_type = 'int8'; language = $language; diarization = $false }
     clips = @{ max_clips = 1; min_duration_s = 12; max_duration_s = 40 }
-    export = @{ ratio = '9:16'; caption_style = 'clean_lower'; prefer_hardware_encoder = $false; write_srt = $true }
+    export = @{ ratio = '9:16'; resolution = $resolution; caption_style = 'clean_lower'; prefer_hardware_encoder = [bool]$NVENC; write_srt = $true }
 }
 [System.IO.File]::WriteAllText((Join-Path $testHome 'config.json'), ($testConfig | ConvertTo-Json -Depth 8), $utf8)
 
 $previousAutoClipHome = $env:AUTOCLIP_HOME
-$previousCudaVisibleDevices = $env:CUDA_VISIBLE_DEVICES
 $previousHuggingFaceOffline = $env:HF_HUB_OFFLINE
 try {
     $env:AUTOCLIP_HOME = $testHome
-    $env:CUDA_VISIBLE_DEVICES = '-1'
     $env:HF_HUB_OFFLINE = '1'
     Invoke-LoggedNative -Executable $autoClipExe -LogPath (Join-Path $testDir 'pipeline.log') -ArgumentList @('clip', $videoPath)
     Invoke-LoggedNative -Executable $autoClipExe -LogPath (Join-Path $testDir 'tarefas.log') -ArgumentList @('jobs')
 }
 finally {
     $env:AUTOCLIP_HOME = $previousAutoClipHome
-    $env:CUDA_VISIBLE_DEVICES = $previousCudaVisibleDevices
     $env:HF_HUB_OFFLINE = $previousHuggingFaceOffline
 }
 
@@ -170,10 +175,10 @@ $result = Read-VideoProbe $clip.FullName (Join-Path $testDir 'saida.ffprobe.json
 $video = @($result.streams | Where-Object codec_type -eq 'video')
 $audio = @($result.streams | Where-Object codec_type -eq 'audio')
 if ($video.Count -ne 1 -or $video[0].codec_name -ne 'h264' -or
-    $video[0].width -ne 1080 -or $video[0].height -ne 1920 -or
+    $video[0].width -ne $width -or $video[0].height -ne $height -or
     $audio.Count -ne 1 -or $audio[0].codec_name -ne 'aac' -or
     'mp4' -notin ($result.format.format_name -split ',')) {
-    throw 'A saída deveria ser um MP4 de 1080 × 1920 com vídeo H.264 e áudio AAC.'
+    throw "A saída deveria ser um MP4 de $width × $height com vídeo H.264 e áudio AAC."
 }
 
 $srtPath = [System.IO.Path]::ChangeExtension($clip.FullName, 'srt')
@@ -194,7 +199,7 @@ $summary = [ordered]@{
     entrada_segundos = $sourceProbe.format.duration
     saida = $clip.FullName
     saida_segundos = $result.format.duration
-    video = 'h264 1080x1920'
+    video = "h264 ${width}x${height}"
     audio = 'aac'
     legenda = $srtPath
 }

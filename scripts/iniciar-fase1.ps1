@@ -66,15 +66,13 @@ try {
         $settings = @{
             active_provider = 'ollama'
             providers = @{ ollama = @{ model = $phaseModel; base_url = $ollamaUrl } }
-            whisper = @{ model = 'base'; language = 'pt'; compute_type = 'int8'; diarization = $false }
+            whisper = @{ model = 'base'; device = 'cpu'; language = 'pt'; compute_type = 'int8'; diarization = $false }
             clips = @{ max_clips = 5 }
-            export = @{ ratio = '9:16'; prefer_hardware_encoder = $false }
+            export = @{ ratio = '9:16'; resolution = '1080p'; prefer_hardware_encoder = $true }
         } | ConvertTo-Json -Depth 5
         [IO.File]::WriteAllText($settingsPath, $settings, [Text.UTF8Encoding]::new($false))
     }
 
-    # O Ollama já foi iniciado com acesso à GPU. O AutoClip usa Whisper na CPU.
-    $env:CUDA_VISIBLE_DEVICES = '-1'
     $serveArgs = @('serve', '--host', '127.0.0.1', '--port', '8000')
     if ($SemNavegador) { $serveArgs += '--no-open' }
     & $autoClipExe @serveArgs

@@ -1,0 +1,3558 @@
+diff --git a/backend/autoclip/api/clips.py b/backend/autoclip/api/clips.py
+--- a/backend/autoclip/api/clips.py
++++ b/backend/autoclip/api/clips.py
+@@ -10,6 +10,7 @@
+ from fastapi.responses import FileResponse
+ 
+ from .. import paths
++from ..config import for_job
+ from ..config import load as load_settings
+ from ..db import store
+ from ..db.models import Export, new_id
+@@ -192,6 +193,7 @@
+ 
+     settings = load_settings()
+     settings.export.write_srt = payload.write_srt
++    settings.export.resolution = payload.resolution or for_job(job.settings).export.resolution
+ 
+     workspace = JobWorkspace(clip.job_id)
+     crop_path = await asyncio.to_thread(_crop_path_for, workspace, clip, source, payload.ratio)
+@@ -199,7 +201,11 @@
+     destination = (
+         paths.exports_dir()
+         / clip.job_id
+-        / export_module.output_filename(clip.title or f"clip-{clip.rank}", payload.ratio)
++        / export_module.output_filename(
++            clip.title or f"clip-{clip.rank}",
++            payload.ratio,
++            settings.export.resolution,
++        )
+     )
+ 
+     request = export_module.ExportRequest(
+diff --git a/backend/autoclip/api/jobs.py b/backend/autoclip/api/jobs.py
+--- a/backend/autoclip/api/jobs.py
++++ b/backend/autoclip/api/jobs.py
+@@ -6,6 +6,7 @@
+ import logging
+ 
+ from fastapi import APIRouter, HTTPException, Request
++from fastapi.responses import PlainTextResponse
+ from sse_starlette.sse import EventSourceResponse
+ 
+ from ..config import load as load_settings
+@@ -13,6 +14,8 @@
+ from ..db.models import Job, new_id
+ from ..jobs.events import broker
+ from ..jobs.queue import queue
++from ..pipeline.runner import JobWorkspace
++from ..providers import PROVIDERS
+ from .schemas import JobCreateIn, JobOut, JobSettingsIn
+ 
+ log = logging.getLogger(__name__)
+@@ -42,6 +45,8 @@
+         merged.export.caption_style = overrides.caption_style
+     if overrides.ratio:
+         merged.export.ratio = overrides.ratio
++    if overrides.resolution:
++        merged.export.resolution = overrides.resolution
+ 
+     return merged
+ 
+@@ -51,6 +56,8 @@
+     source = await asyncio.to_thread(store.get_source, payload.source_id)
+     if source is None:
+         raise HTTPException(status_code=404, detail="Source not found.")
++    if payload.settings.provider and payload.settings.provider not in PROVIDERS:
++        raise HTTPException(status_code=400, detail="Provedor de IA desconhecido.")
+ 
+     settings = _apply_overrides(load_settings(), payload.settings)
+     if settings.clips.min_duration_s >= settings.clips.max_duration_s:
+@@ -99,21 +106,55 @@
+     async def stream():
+         # Send the current state immediately: a client connecting mid-job (or
+         # reconnecting) must not wait for the next progress tick to render.
+-        current = await asyncio.to_thread(store.get_job, job_id)
+-        if current is not None:
+-            yield {
+-                "event": "snapshot",
+-                "data": JobOut.of(current).model_dump_json(),
+-            }
++        async with broker.listen(job_id) as events:
++            source = await asyncio.to_thread(store.get_source, job.source_id)
++
++            async def snapshot():
++                current = await asyncio.to_thread(store.get_job, job_id)
++                return JobOut.of(current, source) if current else None
++
++            current = await snapshot()
++            if current is None:
++                return
++            yield {"event": "snapshot", "data": current.model_dump_json()}
+             if current.status in ("done", "failed", "cancelled"):
+                 return
+ 
+-        async for event in broker.subscribe(job_id):
+-            if await request.is_disconnected():
+-                break
+-            yield {"event": event.type, "data": event.to_sse().split("data: ", 1)[-1].strip()}
++            async for event in events:
++                if await request.is_disconnected():
++                    break
++                if event.type == "heartbeat":
++                    current = await snapshot()
++                    if current is None:
++                        return
++                    yield {"event": "snapshot", "data": current.model_dump_json()}
++                    if current.status in ("done", "failed", "cancelled"):
++                        return
++                else:
++                    yield {
++                        "event": event.type,
++                        "data": event.to_sse().split("data: ", 1)[-1].strip(),
++                    }
+ 
+     return EventSourceResponse(stream())
++
++
++@router.get("/{job_id}/log", response_class=PlainTextResponse)
++async def job_log(job_id: str) -> str:
++    """Show the latest pipeline log without opening the full file in memory."""
++
++    def read() -> str:
++        if store.get_job(job_id) is None:
++            raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
++        path = JobWorkspace(job_id).log_file
++        try:
++            with path.open("rb") as file:
++                file.seek(max(0, path.stat().st_size - 64 * 1024))
++                return file.read(64 * 1024).decode("utf-8", errors="replace")
++        except FileNotFoundError:
++            return "Esta tarefa ainda não tem registro de processamento."
++
++    return await asyncio.to_thread(read)
+ 
+ 
+ @router.post("/{job_id}/cancel", response_model=JobOut)
+@@ -141,13 +182,12 @@
+     job = await asyncio.to_thread(store.get_job, job_id)
+     if job is None:
+         raise HTTPException(status_code=404, detail="Job not found.")
+-    if job.status not in ("failed", "cancelled"):
++    if not await asyncio.to_thread(store.retry_job, job_id):
+         raise HTTPException(
+             status_code=409,
+             detail=f"Only failed or cancelled jobs can be retried (this one is {job.status}).",
+         )
+ 
+-    await asyncio.to_thread(store.update_job, job_id, status="queued", error=None, progress=0.0)
+     queue.notify()
+ 
+     updated = await asyncio.to_thread(store.get_job, job_id)
+diff --git a/backend/autoclip/api/schemas.py b/backend/autoclip/api/schemas.py
+--- a/backend/autoclip/api/schemas.py
++++ b/backend/autoclip/api/schemas.py
+@@ -68,6 +68,7 @@
+     max_clips: int | None = Field(default=None, ge=1, le=50)
+     caption_style: str | None = None
+     ratio: Literal["9:16", "1:1", "16:9"] | None = None
++    resolution: Literal["1080p", "720p"] | None = None
+ 
+ 
+ class JobCreateIn(BaseModel):
+@@ -81,6 +82,8 @@
+     status: str
+     current_stage: str
+     progress: float
++    stage_progress: float
++    progress_message: str
+     error: str | None = None
+     provider: str
+     created_at: str
+@@ -97,6 +100,8 @@
+             status=job.status,
+             current_stage=job.current_stage,
+             progress=job.progress,
++            stage_progress=job.stage_progress,
++            progress_message=job.progress_message,
+             error=job.error,
+             provider=job.provider,
+             created_at=job.created_at,
+@@ -203,6 +208,7 @@
+     ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
+     style: str = "bold_pop"
+     write_srt: bool = False
++    resolution: Literal["1080p", "720p"] | None = None
+ 
+ 
+ class CaptionStyleOut(BaseModel):
+@@ -256,7 +262,10 @@
+     ffmpeg_version: str | None
+     has_libass: bool
+     nvenc_works: bool
++    nvenc_error: str
+     accel: str
+     gpu_name: str | None
++    driver_version: str | None
++    whisper_device: str
+     compute_type: str
+     diarization_available: bool
+diff --git a/backend/autoclip/api/settings.py b/backend/autoclip/api/settings.py
+--- a/backend/autoclip/api/settings.py
++++ b/backend/autoclip/api/settings.py
+@@ -8,6 +8,7 @@
+ from fastapi import APIRouter, HTTPException
+ 
+ from .. import config, models, system
++from ..pipeline.transcribe import resolve_compute
+ from ..providers import PROVIDERS, build_provider
+ from ..providers.base import ProviderStatus
+ from .schemas import ProviderStatusOut, SecretIn, SettingsIn, SettingsOut, SystemOut
+@@ -133,6 +134,11 @@
+ @router.get("/system", response_model=SystemOut)
+ async def system_status() -> SystemOut:
+     report = await asyncio.to_thread(system.refresh)
++    whisper_device, compute_type = await asyncio.to_thread(
++        resolve_compute,
++        config.load().whisper,
++        report.gpu,
++    )
+     return SystemOut(
+         ready=report.ready,
+         python_version=report.python_version,
+@@ -140,9 +146,12 @@
+         ffmpeg_version=report.ffmpeg.version,
+         has_libass=report.ffmpeg.has_libass,
+         nvenc_works=report.ffmpeg.nvenc_works,
++        nvenc_error=report.ffmpeg.nvenc_error,
+         accel=report.gpu.accel,
+         gpu_name=report.gpu.name,
+-        compute_type=report.gpu.compute_type,
++        driver_version=report.gpu.driver_version,
++        whisper_device=whisper_device,
++        compute_type=compute_type,
+         diarization_available=report.deps.whisperx,
+     )
+ 
+diff --git a/backend/autoclip/cli.py b/backend/autoclip/cli.py
+--- a/backend/autoclip/cli.py
++++ b/backend/autoclip/cli.py
+@@ -113,11 +113,8 @@
+         if ff.has_nvenc and not ff.nvenc_works:
+             table.add_row("  h264_nvenc", WARN, ff.nvenc_error or "listed but not usable")
+             remediation.append(
+-                "This ffmpeg build lists [cyan]h264_nvenc[/cyan] but the GPU driver is "
+-                "too old for the NVENC API it was built against, so exports will use "
+-                "the CPU encoder. Update your NVIDIA driver to enable GPU encoding — "
+-                "or ignore this, since software encoding produces identical quality, "
+-                "just slower."
++                "O teste de [cyan]h264_nvenc[/cyan] falhou. As exportações podem usar "
++                "libx264. Consulte o detalhe do teste para identificar a causa."
+             )
+         else:
+             table.add_row(
+@@ -173,21 +170,21 @@
+             "Transcription will fall back to CPU until this is fixed."
+         )
+     elif gpu.ctranslate2_cuda:
+-        accel_table.add_row("CUDA for Whisper", OK, "CTranslate2 sees the GPU")
++        accel_table.add_row("CUDA for Whisper", OK, "GPU detectada; inferência ainda não testada")
+ 
+     if gpu.supported_compute_types:
+         accel_table.add_row(
+             "Supported compute types", OK, ", ".join(sorted(gpu.supported_compute_types))
+         )
+ 
+-    reason = ""
+-    if gpu.accel == "cuda" and not gpu.compute_type.startswith("float16"):
+-        reason = " (this GPU has no usable fp16 path)"
+-    accel_table.add_row("Whisper compute type", OK, f"{gpu.compute_type}{reason}")
++    from .pipeline.transcribe import resolve_compute
++
++    whisper_device, whisper_compute = resolve_compute(settings.whisper, gpu)
++    accel_table.add_row("Whisper configurado", OK, f"{whisper_device.upper()} / {whisper_compute}")
+ 
+     override = settings.whisper.compute_type
+     if override:
+-        usable = not gpu.supported_compute_types or override in gpu.supported_compute_types
++        usable = override == whisper_compute
+         accel_table.add_row(
+             "  override in config",
+             _status(usable, warn_only=True),
+@@ -410,6 +407,7 @@
+     max_clips: int = typer.Option(0, "--max-clips", "-n", help="Override the clip count."),
+     style: str = typer.Option("", "--style", "-s", help="Caption style preset."),
+     ratio: str = typer.Option("", "--ratio", "-r", help="Output ratio: 9:16, 1:1, or 16:9."),
++    fast: bool = typer.Option(False, "--fast", help="Renderizar no perfil rápido de 720p."),
+     diarize: bool = typer.Option(
+         False, "--diarize/--no-diarize", help="Label speakers (needs the diarization extra)."
+     ),
+@@ -438,6 +436,8 @@
+         settings.export.caption_style = style
+     if ratio:
+         settings.export.ratio = ratio  # type: ignore[assignment]
++    if fast:
++        settings.export.resolution = "720p"
+     if diarize:
+         settings.whisper.diarization = True
+     if centre_crop:
+diff --git a/backend/autoclip/config.py b/backend/autoclip/config.py
+--- a/backend/autoclip/config.py
++++ b/backend/autoclip/config.py
+@@ -56,6 +56,8 @@
+ class WhisperSettings(BaseModel):
+     #: tiny | base | small | medium | large-v3 — or a local path.
+     model: str = "small"
++    #: Empty keeps legacy auto-selection for direct callers. The app defaults to CPU.
++    device: Literal["", "cpu", "auto"] = ""
+     #: Force a CTranslate2 compute type. Empty means "let hardware detection pick".
+     compute_type: str = ""
+     #: ISO 639-1 code, or empty for auto-detection.
+@@ -84,6 +86,7 @@
+ 
+ class ExportSettings(BaseModel):
+     ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
++    resolution: Literal["1080p", "720p"] = "1080p"
+     caption_style: str = "bold_pop"
+     #: Integrated loudness target in LUFS. -14 is the de-facto platform standard.
+     loudness_lufs: float = -14.0
+@@ -106,7 +109,7 @@
+             "ollama": ProviderSettings(model="", base_url="http://localhost:11434"),
+         }
+     )
+-    whisper: WhisperSettings = Field(default_factory=WhisperSettings)
++    whisper: WhisperSettings = Field(default_factory=lambda: WhisperSettings(device="cpu"))
+     clips: ClipSettings = Field(default_factory=ClipSettings)
+     ingest: IngestSettings = Field(default_factory=IngestSettings)
+     export: ExportSettings = Field(default_factory=ExportSettings)
+@@ -139,8 +142,29 @@
+         return Settings()
+ 
+     fallback = raw.pop("_fallback_secrets", {}) or {}
++    if isinstance(raw.get("whisper"), dict):
++        raw["whisper"].setdefault("device", "cpu")
+     settings = Settings.model_validate(raw)
+     settings._fallback_secrets = fallback
++    return settings
++
++
++def for_job(snapshot: dict[str, Any]) -> Settings:
++    """Restore per-job choices while keeping credentials in the current secret store."""
++    current = load()
++    if not snapshot:
++        return current
++    payload = current.model_dump(mode="json")
++    for key, value in snapshot.items():
++        if key not in payload:
++            continue
++        previous = payload[key]
++        if isinstance(previous, dict) and isinstance(value, dict):
++            payload[key] = previous | value
++        else:
++            payload[key] = value
++    settings = Settings.model_validate(payload)
++    settings._fallback_secrets = current._fallback_secrets.copy()
+     return settings
+ 
+ 
+diff --git a/backend/autoclip/cuda.py b/backend/autoclip/cuda.py
+--- a/backend/autoclip/cuda.py
++++ b/backend/autoclip/cuda.py
+@@ -26,6 +26,7 @@
+ from pathlib import Path
+ 
+ log = logging.getLogger(__name__)
++_dll_handles: list[object] = []
+ 
+ #: Components shipped as separate wheels. Order matters on POSIX: cuBLAS
+ #: depends on cuBLASLt, and a dependency must be resident before its dependant.
+@@ -53,11 +54,15 @@
+ def library_directories() -> list[Path]:
+     """Return the NVIDIA library directories present in this environment."""
+     root = _nvidia_root()
++    found: list[Path] = []
++    if sys.platform == "win32" and (configured := os.environ.get("AUTOCLIP_CUDA_RUNTIME_DIR")):
++        path = Path(configured)
++        if path.is_absolute() and (path / "cublas64_12.dll").is_file():
++            found.append(path)
+     if root is None:
+-        return []
++        return found
+ 
+     subdir = _WINDOWS_SUBDIR if sys.platform == "win32" else _POSIX_SUBDIR
+-    found: list[Path] = []
+ 
+     for component in _COMPONENTS:
+         path = root / component / subdir
+@@ -91,7 +96,7 @@
+     for directory in directories:
+         try:
+             if sys.platform == "win32":
+-                os.add_dll_directory(str(directory))
++                _dll_handles.append(os.add_dll_directory(str(directory)))
+             else:
+                 _preload_shared_objects(directory)
+             registered.append(directory)
+diff --git a/backend/autoclip/db/models.py b/backend/autoclip/db/models.py
+--- a/backend/autoclip/db/models.py
++++ b/backend/autoclip/db/models.py
+@@ -80,6 +80,8 @@
+     updated_at: str = field(default_factory=utcnow)
+     started_at: str | None = None
+     finished_at: str | None = None
++    stage_progress: float = 0.0
++    progress_message: str = ""
+ 
+     @classmethod
+     def from_row(cls, row: sqlite3.Row) -> Job:
+@@ -96,6 +98,8 @@
+             updated_at=row["updated_at"],
+             started_at=row["started_at"],
+             finished_at=row["finished_at"],
++            stage_progress=row["stage_progress"],
++            progress_message=row["progress_message"],
+         )
+ 
+ 
+diff --git a/backend/autoclip/db/schema.py b/backend/autoclip/db/schema.py
+--- a/backend/autoclip/db/schema.py
++++ b/backend/autoclip/db/schema.py
+@@ -104,9 +104,17 @@
+     conn.executescript(_V1)
+ 
+ 
++def _migration_v2(conn: sqlite3.Connection) -> None:
++    conn.execute("BEGIN IMMEDIATE")
++    if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
++        return
++    conn.execute("ALTER TABLE jobs ADD COLUMN stage_progress REAL NOT NULL DEFAULT 0")
++    conn.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
++
++
+ #: Ordered migrations. Index + 1 is the resulting ``user_version``.
+ #: Append only — never edit a migration that has shipped.
+-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1]
++MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1, _migration_v2]
+ 
+ SCHEMA_VERSION = len(MIGRATIONS)
+ 
+diff --git a/backend/autoclip/db/store.py b/backend/autoclip/db/store.py
+--- a/backend/autoclip/db/store.py
++++ b/backend/autoclip/db/store.py
+@@ -82,8 +82,8 @@
+             """
+             INSERT INTO jobs (id, source_id, status, current_stage, progress, error,
+                               provider, settings_json, created_at, updated_at,
+-                              started_at, finished_at)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                              started_at, finished_at, stage_progress, progress_message)
++            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             """,
+             (
+                 job.id,
+@@ -98,6 +98,8 @@
+                 job.updated_at,
+                 job.started_at,
+                 job.finished_at,
++                job.stage_progress,
++                job.progress_message,
+             ),
+         )
+     return job
+@@ -143,6 +145,8 @@
+     status: JobStatus | None = None,
+     current_stage: str | None = None,
+     progress: float | None = None,
++    stage_progress: float | None = None,
++    progress_message: str | None = None,
+     error: str | None | _Unset = UNSET,
+     started_at: str | None | _Unset = UNSET,
+     finished_at: str | None | _Unset = UNSET,
+@@ -159,6 +163,8 @@
+         ("status", status),
+         ("current_stage", current_stage),
+         ("progress", progress),
++        ("stage_progress", stage_progress),
++        ("progress_message", progress_message),
+     ):
+         if value is not None:
+             fields[name] = value
+@@ -186,6 +192,28 @@
+             "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
+         ).fetchone()
+     return Job.from_row(row) if row else None
++
++
++def claim_job(job_id: str) -> bool:
++    with connection() as conn:
++        updated = conn.execute(
++            "UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'queued'",
++            (utcnow(), job_id),
++        )
++    return updated.rowcount == 1
++
++
++def retry_job(job_id: str) -> bool:
++    """Requeue a stopped job once, even when multiple retry requests arrive."""
++    with connection() as conn:
++        updated = conn.execute(
++            """UPDATE jobs SET status = 'queued', current_stage = '', progress = 0,
++                       stage_progress = 0, progress_message = '', error = NULL,
++                       finished_at = NULL, started_at = NULL, updated_at = ?
++               WHERE id = ? AND status IN ('failed', 'cancelled')""",
++            (utcnow(), job_id),
++        )
++    return updated.rowcount == 1
+ 
+ 
+ # --------------------------------------------------------------------------
+diff --git a/backend/autoclip/jobs/events.py b/backend/autoclip/jobs/events.py
+--- a/backend/autoclip/jobs/events.py
++++ b/backend/autoclip/jobs/events.py
+@@ -20,6 +20,8 @@
+ from collections.abc import AsyncIterator
+ from dataclasses import asdict, dataclass, field
+ from typing import Any
++
++from ..db.models import utcnow
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -77,19 +79,26 @@
+             try:
+                 queue.put_nowait(event)
+             except asyncio.QueueFull:
+-                # The client isn't keeping up. Losing an intermediate progress
+-                # frame is harmless; the next one carries the current state.
+-                log.debug("Dropped an event for a slow subscriber on job %s.", event.job_id)
++                queue.get_nowait()
++                queue.put_nowait(event)
++                log.debug("Replaced a stale event for job %s.", event.job_id)
+ 
+     # -- subscribing -------------------------------------------------------
+ 
+     async def subscribe(self, job_id: str) -> AsyncIterator[Event]:
+         """Yield events for ``job_id`` until the client disconnects."""
++        async with self.listen(job_id) as events:
++            async for event in events:
++                yield event
++
++    @contextlib.asynccontextmanager
++    async def listen(self, job_id: str) -> AsyncIterator[AsyncIterator[Event]]:
++        """Register before the caller reads its first durable snapshot."""
+         queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=QUEUE_SIZE)
+         async with self._lock:
+             self._subscribers.setdefault(job_id, set()).add(queue)
+ 
+-        try:
++        async def receive() -> AsyncIterator[Event]:
+             while True:
+                 try:
+                     event = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
+@@ -100,6 +109,9 @@
+                 yield event
+                 if event.type in ("done", "failed", "cancelled"):
+                     return
++
++        try:
++            yield receive()
+         finally:
+             async with self._lock:
+                 subscribers = self._subscribers.get(job_id)
+@@ -126,6 +138,7 @@
+             "stage_progress": round(event.stage_progress, 4),
+             "overall": round(event.overall, 4),
+             "message": event.message,
++            "updated_at": utcnow(),
+         },
+     )
+ 
+diff --git a/backend/autoclip/jobs/queue.py b/backend/autoclip/jobs/queue.py
+--- a/backend/autoclip/jobs/queue.py
++++ b/backend/autoclip/jobs/queue.py
+@@ -60,7 +60,8 @@
+         self._stopping = True
+         self.notify()
+         if self._task is not None:
+-            self._task.cancel()
++            # A cancelled asyncio task does not stop asyncio.to_thread. Wait for
++            # the pipeline to stop its subprocess and persist its checkpoints.
+             with contextlib.suppress(asyncio.CancelledError):
+                 await self._task
+             self._task = None
+@@ -89,10 +90,11 @@
+         if job is None or job.status in ("done", "failed", "cancelled"):
+             return False
+ 
+-        self._cancel_requested.add(job_id)
+         if job.status == "queued":
+             store.update_job(job_id, status="cancelled")
+             broker.publish(Event(type="cancelled", job_id=job_id))
++        else:
++            self._cancel_requested.add(job_id)
+         return True
+ 
+     def is_cancelled(self, job_id: str) -> bool:
+@@ -111,13 +113,14 @@
+         assert wakeup is not None
+ 
+         while not self._stopping:
++            wakeup.clear()
+             job = await asyncio.to_thread(store.next_queued_job)
+             if job is None:
+-                wakeup.clear()
+                 await wakeup.wait()
+                 continue
+ 
+-            await self._run_one(job)
++            if not self._stopping and store.claim_job(job.id):
++                await self._run_one(job)
+ 
+     async def _run_one(self, job: Job) -> None:
+         source = await asyncio.to_thread(store.get_source, job.source_id)
+@@ -133,19 +136,25 @@
+         def on_progress(event) -> None:
+             broker.publish(progress_event(job.id, event))
+ 
+-        runner = PipelineRunner(
+-            job,
+-            source,
+-            on_progress=on_progress,
+-            is_cancelled=lambda: self.is_cancelled(job.id),
+-        )
+-
+         try:
++            runner = PipelineRunner(
++                job,
++                source,
++                on_progress=on_progress,
++                is_cancelled=lambda: self._stopping or self.is_cancelled(job.id),
++            )
+             clips = await asyncio.to_thread(_run_blocking, runner)
+         except JobCancelled:
+-            broker.publish(Event(type="cancelled", job_id=job.id))
+-            log.info("Job %s cancelled.", job.id)
++            if self._stopping and not self.is_cancelled(job.id):
++                store.retry_job(job.id)
++                log.info("Tarefa %s volta à fila na próxima inicialização.", job.id)
++            else:
++                broker.publish(Event(type="cancelled", job_id=job.id))
++                log.info("Job %s cancelled.", job.id)
+         except Exception as exc:
++            current = store.get_job(job.id)
++            if current and current.status == "running":
++                store.update_job(job.id, status="failed", error=str(exc))
+             broker.publish(Event(type="failed", job_id=job.id, data={"error": str(exc)}))
+             log.exception("Job %s failed.", job.id)
+         else:
+diff --git a/backend/autoclip/pipeline/__init__.py b/backend/autoclip/pipeline/__init__.py
+--- a/backend/autoclip/pipeline/__init__.py
++++ b/backend/autoclip/pipeline/__init__.py
+@@ -5,6 +5,10 @@
+ __all__ = ["STAGES", "Stage"]
+ 
+ from enum import StrEnum
++
++
++class Cancelled(RuntimeError):
++    """The user requested that the current operation stop."""
+ 
+ 
+ class Stage(StrEnum):
+@@ -25,12 +29,12 @@
+     @property
+     def label(self) -> str:
+         return {
+-            Stage.PREPARE: "Preparing media",
+-            Stage.TRANSCRIBE: "Transcribing",
+-            Stage.HIGHLIGHTS: "Finding highlights",
+-            Stage.REFRAME: "Reframing to vertical",
+-            Stage.CAPTIONS: "Generating captions",
+-            Stage.EXPORT: "Exporting clips",
++            Stage.PREPARE: "Preparando mídia",
++            Stage.TRANSCRIBE: "Transcrevendo áudio",
++            Stage.HIGHLIGHTS: "Selecionando momentos",
++            Stage.REFRAME: "Ajustando o enquadramento",
++            Stage.CAPTIONS: "Preparando legendas",
++            Stage.EXPORT: "Renderizando cortes",
+         }[self]
+ 
+ 
+diff --git a/backend/autoclip/pipeline/export.py b/backend/autoclip/pipeline/export.py
+--- a/backend/autoclip/pipeline/export.py
++++ b/backend/autoclip/pipeline/export.py
+@@ -10,6 +10,7 @@
+ 
+ import logging
+ import re
++import uuid
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -62,10 +63,11 @@
+         return self.end_s - self.start_s
+ 
+ 
+-def ratio_dimensions(ratio: str) -> tuple[int, int]:
++def ratio_dimensions(ratio: str, resolution: str = "1080p") -> tuple[int, int]:
+     if ratio not in RATIOS:
+         raise ExportError(f"Unknown ratio {ratio!r}. Available: {', '.join(RATIOS)}")
+-    return RATIOS[ratio]
++    width, height = RATIOS[ratio]
++    return (width * 2 // 3, height * 2 // 3) if resolution == "720p" else (width, height)
+ 
+ 
+ def slugify_title(title: str, *, max_length: int = 50) -> str:
+@@ -75,8 +77,9 @@
+     return slug[:max_length] or "clip"
+ 
+ 
+-def output_filename(title: str, ratio: str) -> str:
+-    return f"{slugify_title(title)}_{ratio.replace(':', 'x')}.mp4"
++def output_filename(title: str, ratio: str, resolution: str = "1080p") -> str:
++    profile = "_720p" if resolution == "720p" else ""
++    return f"{slugify_title(title)}_{ratio.replace(':', 'x')}{profile}.mp4"
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -89,9 +92,10 @@
+     *,
+     subtitle_name: str | None,
+     fonts_name: str = "fonts",
++    resolution: str = "1080p",
+ ) -> str:
+     """Build the ``-filter_complex`` video chain for one clip."""
+-    out_w, out_h = ratio_dimensions(request.ratio)
++    out_w, out_h = ratio_dimensions(request.ratio, resolution)
+     segments = request.crop_path.segments
+     if not segments:
+         raise ExportError("The crop path has no segments.")
+@@ -122,7 +126,8 @@
+         chain = [segment_crop_filter(segment)]
+         if segment.zoom > 0:
+             chain.append(_zoom_filter(segment.zoom, out_w, out_h))
+-        chain.append(f"scale={out_w}:{out_h}:flags=lanczos")
++        scaler = "bilinear" if resolution == "720p" else "lanczos"
++        chain.append(f"scale={out_w}:{out_h}:flags={scaler}")
+         chain.append("setsar=1,format=yuv420p")
+ 
+         parts.append(f"{source_label}{','.join(chain)}[{label}]")
+@@ -179,19 +184,20 @@
+     return f"loudnorm=I={settings.loudness_lufs}:TP={LOUDNESS_TRUE_PEAK}:LRA={LOUDNESS_RANGE}"
+ 
+ 
+-def encoder_args(settings: ExportSettings) -> list[str]:
++def encoder_args(settings: ExportSettings, *, software: bool = False) -> list[str]:
+     """Pick the video encoder and its quality settings.
+ 
+     NVENC is materially faster where available. Its quality knob is ``-cq``
+     rather than ``-crf``, and the two scales are close enough that reusing the
+     configured value keeps output consistent between machines.
+     """
+-    if settings.prefer_hardware_encoder and report().ffmpeg.nvenc_works:
++    fast = settings.resolution == "720p"
++    if not software and settings.prefer_hardware_encoder and report().ffmpeg.nvenc_works:
+         return [
+             "-c:v",
+             "h264_nvenc",
+             "-preset",
+-            "p5",
++            "p3" if fast else "p5",
+             "-rc",
+             "vbr",
+             "-cq",
+@@ -205,7 +211,7 @@
+         "-c:v",
+         "libx264",
+         "-preset",
+-        "medium",
++        "veryfast" if fast else "medium",
+         "-crf",
+         str(settings.crf),
+         "-profile:v",
+@@ -225,6 +231,7 @@
+     settings: ExportSettings | None = None,
+     on_progress: Callable[[float], None] | None = None,
+     cancelled: Callable[[], bool] | None = None,
++    on_detail: Callable[[float, str], None] | None = None,
+ ) -> Path:
+     """Render one clip to an MP4 and return the output path.
+ 
+@@ -233,11 +240,11 @@
+         in clip-relative seconds.
+     """
+     settings = settings or ExportSettings()
+-    out_w, out_h = ratio_dimensions(request.ratio)
++    out_w, out_h = ratio_dimensions(request.ratio, settings.resolution)
+ 
+     # Each clip renders in its own workspace so concurrent exports can't collide
+     # on the shared `captions.ass` name that the relative-path scheme requires.
+-    workspace = work_dir / request.destination.stem
++    workspace = work_dir / request.destination.stem / uuid.uuid4().hex[:12]
+     workspace.mkdir(parents=True, exist_ok=True)
+ 
+     subtitle_name: str | None = None
+@@ -258,14 +265,17 @@
+         )
+ 
+     filtergraph = build_video_filtergraph(
+-        request, subtitle_name=subtitle_name, fonts_name=fonts_name
++        request,
++        subtitle_name=subtitle_name,
++        fonts_name=fonts_name,
++        resolution=settings.resolution,
+     )
+ 
+     request.destination.parent.mkdir(parents=True, exist_ok=True)
+ 
+     # Input and output paths are ordinary argv arguments, so they stay absolute
+     # and need no escaping regardless of the working directory.
+-    args = [
++    input_args = [
+         # Seeking before -i decodes from the nearest keyframe and is far faster
+         # than an output-side seek; modern ffmpeg keeps it frame-accurate.
+         "-ss",
+@@ -282,7 +292,8 @@
+         "0:a?",
+         "-af",
+         build_audio_filtergraph(settings),
+-        *encoder_args(settings),
++    ]
++    output_args = [
+         "-pix_fmt",
+         "yuv420p",
+         "-c:a",
+@@ -293,22 +304,46 @@
+         str(AUDIO_SAMPLE_RATE),
+         "-movflags",
+         "+faststart",
+-        str(request.destination),
+     ]
+ 
+-    try:
++    partial = request.destination.with_suffix(f".{workspace.name}.part.mp4")
++
++    def render(codec_args: list[str]) -> None:
++        encoder = codec_args[1]
++        log.info("Render %s (%dx%d) com %s.", request.destination.name, out_w, out_h, encoder)
++        if on_detail:
++            on_detail(0, encoder)
++
++        def report_progress(fraction: float) -> None:
++            if on_progress:
++                on_progress(fraction)
++            if on_detail:
++                on_detail(fraction, encoder)
++
+         ffmpeg.run(
+-            args,
++            [*input_args, *codec_args, *output_args, str(partial)],
+             total_duration_s=request.duration_s,
+-            on_progress=on_progress,
++            on_progress=report_progress,
+             cancelled=cancelled,
+             cwd=render_cwd,
+         )
++
++    try:
++        codec_args = encoder_args(settings)
++        try:
++            render(codec_args)
++        except ffmpeg.FFmpegError as exc:
++            if codec_args[1] != "h264_nvenc" or not _is_nvenc_failure(exc):
++                raise
++            log.warning("NVENC falhou; tentando libx264: %s", exc)
++            render(encoder_args(settings, software=True))
++        if not partial.is_file() or partial.stat().st_size == 0:
++            raise ExportError(f"O FFmpeg gerou um arquivo vazio para {request.destination.name}.")
++        partial.replace(request.destination)
+     except ffmpeg.FFmpegError as exc:
+-        raise ExportError(f"Could not render {request.destination.name}.\n{exc}") from exc
+-
+-    if not request.destination.exists() or request.destination.stat().st_size == 0:
+-        raise ExportError(f"ffmpeg reported success but {request.destination.name} is empty.")
++        raise ExportError(f"Falha ao renderizar {request.destination.name}.\n{exc}") from exc
++    finally:
++        partial.unlink(missing_ok=True)
+ 
+     if settings.write_srt and request.words:
+         captions_module.write_srt(
+@@ -324,3 +359,10 @@
+         request.ratio,
+     )
+     return request.destination
++
++
++def _is_nvenc_failure(exc: ffmpeg.FFmpegError) -> bool:
++    if isinstance(exc, ffmpeg.FFmpegStalled):
++        return True
++    output = exc.stderr.lower()
++    return any(term in output for term in ("nvenc", "nvcuda", "libcuda", "openencodesession"))
+diff --git a/backend/autoclip/pipeline/ffmpeg.py b/backend/autoclip/pipeline/ffmpeg.py
+--- a/backend/autoclip/pipeline/ffmpeg.py
++++ b/backend/autoclip/pipeline/ffmpeg.py
+@@ -17,16 +17,18 @@
+ from __future__ import annotations
+ 
+ import json
+-import logging
++import math
+ import shutil
+ import subprocess
+ from collections.abc import Callable, Sequence
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+-log = logging.getLogger(__name__)
++from . import Cancelled as Cancelled
++from . import process
+ 
+ ProgressCallback = Callable[[float], None]
++IDLE_TIMEOUT_S = 120.0
+ 
+ 
+ class FFmpegError(RuntimeError):
+@@ -65,6 +67,7 @@
+     video_codec: str | None = None
+     audio_codec: str | None = None
+     title: str | None = None
++    audio_duration_s: float | None = None
+ 
+     @property
+     def aspect_ratio(self) -> float | None:
+@@ -164,7 +167,21 @@
+         "-show_streams",
+         str(path),
+     ]
+-    proc = subprocess.run(command, capture_output=True, text=True, check=False, encoding="utf-8")
++    try:
++        proc = subprocess.run(
++            command,
++            capture_output=True,
++            text=True,
++            check=False,
++            encoding="utf-8",
++            errors="replace",
++            timeout=30,
++        )
++    except subprocess.TimeoutExpired as exc:
++        raise FFmpegError(
++            f"O ffprobe não respondeu em 30 s ao ler {path.name}. Confira o arquivo e o disco.",
++            command=command,
++        ) from exc
+     if proc.returncode != 0:
+         raise FFmpegError(f"Could not read {path.name}.", command=command, stderr=proc.stderr or "")
+ 
+@@ -179,7 +196,12 @@
+     fmt = data.get("format", {})
+ 
+     video = next((s for s in streams if s.get("codec_type") == "video"), None)
+-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
++    # Match FFmpeg's automatic audio selection, which prefers more channels.
++    audio = max(
++        (s for s in streams if s.get("codec_type") == "audio"),
++        key=lambda s: _as_int(s.get("channels")) or 0,
++        default=None,
++    )
+ 
+     # Cover art in an audio file shows up as a video stream; a still image is
+     # not something we can reframe, so don't count it as video.
+@@ -188,7 +210,7 @@
+ 
+     info = MediaInfo(
+         path=path,
+-        duration_s=float(fmt.get("duration") or 0.0),
++        duration_s=_duration(fmt.get("duration")) or 0.0,
+         has_video=video is not None,
+         has_audio=audio is not None,
+         title=(fmt.get("tags") or {}).get("title"),
+@@ -201,6 +223,7 @@
+         info.video_codec = video.get("codec_name")
+     if audio is not None:
+         info.audio_codec = audio.get("codec_name")
++        info.audio_duration_s = _duration(audio.get("duration"))
+ 
+     return info
+ 
+@@ -210,6 +233,14 @@
+         return int(value)  # type: ignore[arg-type]
+     except (TypeError, ValueError):
+         return None
++
++
++def _duration(value: str | None) -> float | None:
++    try:
++        seconds = float(value or 0)
++    except ValueError:
++        return None
++    return seconds if math.isfinite(seconds) and seconds > 0 else None
+ 
+ 
+ def _parse_fps(rate: str | None) -> float | None:
+@@ -272,98 +303,64 @@
+     on_progress: ProgressCallback | None = None,
+     cancelled: Callable[[], bool] | None = None,
+     cwd: Path | None = None,
++    idle_timeout_s: float = IDLE_TIMEOUT_S,
++    on_stderr: Callable[[str], None] | None = None,
+ ) -> None:
+-    """Run ffmpeg, optionally reporting progress as a 0..1 fraction.
+-
+-    ``args`` excludes the executable name and the flags this function supplies
+-    (``-hide_banner``, ``-y``, ``-nostdin``, and the progress plumbing).
+-
+-    Preconditions:
+-        total_duration_s is the expected output duration when on_progress is set;
+-        without it progress cannot be computed and the callback is never invoked.
+-    """
++    """Run FFmpeg with independent progress, stderr drainage and cancellation."""
+     command = [
+         ffmpeg_path(),
+         "-hide_banner",
+         "-nostdin",
+         "-y",
+         "-loglevel",
+-        "error",
++        "info" if on_stderr else "error",
++        "-progress",
++        "pipe:1",
++        "-nostats",
+     ]
+-    if on_progress and total_duration_s:
+-        command += ["-progress", "pipe:1", "-nostats"]
+     command += list(args)
+ 
+-    log.debug("ffmpeg %s", " ".join(command[1:]))
+-
+-    proc = subprocess.Popen(
++    def report(update: process.Update) -> None:
++        if on_progress and total_duration_s and total_duration_s > 0:
++            on_progress(min(1.0, update.position / total_duration_s))
++
++    result = process.run(
+         command,
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.PIPE,
+-        text=True,
+-        encoding="utf-8",
+-        errors="replace",
+-        cwd=str(cwd) if cwd else None,
++        label="FFmpeg",
++        parse=_parse_progress,
++        idle_timeout_s=idle_timeout_s,
++        on_progress=report,
++        cancelled=cancelled,
++        cwd=cwd,
++        on_stderr=on_stderr,
+     )
+-
+-    try:
+-        if on_progress and total_duration_s and proc.stdout is not None:
+-            _pump_progress(proc, total_duration_s, on_progress, cancelled)
+-        elif cancelled is not None:
+-            _wait_cancellable(proc, cancelled)
+-
+-        stdout, stderr = proc.communicate()
+-    except BaseException:
+-        proc.kill()
+-        proc.wait()
+-        raise
+-
+-    if proc.returncode != 0:
+-        raise FFmpegError(
+-            f"ffmpeg exited with code {proc.returncode}.",
++    if result.stalled:
++        message = (
++            f"FFmpeg ficou {idle_timeout_s:g} s sem avançar "
++            f"(última posição {result.progress.position:.1f} s). "
++            "Confira a origem e o espaço em disco, depois tente novamente."
++        )
++        raise FFmpegStalled(message, command=command, stderr=result.stderr)
++    if result.code != 0:
++        raise FFmpegError(
++            f"FFmpeg terminou com código {result.code}.",
+             command=command,
+-            stderr=stderr or "",
+-        )
+-
++            stderr=result.stderr,
++        )
+     if on_progress:
+         on_progress(1.0)
+ 
+ 
+-class Cancelled(RuntimeError):
+-    """Raised when a cancellation predicate returns True mid-render."""
+-
+-
+-def _pump_progress(
+-    proc: subprocess.Popen[str],
+-    total_duration_s: float,
+-    on_progress: ProgressCallback,
+-    cancelled: Callable[[], bool] | None,
+-) -> None:
+-    assert proc.stdout is not None
+-    for line in proc.stdout:
+-        if cancelled is not None and cancelled():
+-            proc.kill()
+-            raise Cancelled("Render cancelled.")
+-
+-        key, _, value = line.strip().partition("=")
+-        # out_time_us is microseconds; older builds emit out_time_ms which is
+-        # *also* microseconds despite the name. Handle both identically.
+-        if key in ("out_time_us", "out_time_ms"):
+-            try:
+-                elapsed = int(value) / 1_000_000
+-            except ValueError:
+-                continue
+-            on_progress(max(0.0, min(1.0, elapsed / total_duration_s)))
+-        elif key == "progress" and value == "end":
+-            on_progress(1.0)
+-
+-
+-def _wait_cancellable(proc: subprocess.Popen[str], cancelled: Callable[[], bool]) -> None:
+-    while True:
++def _parse_progress(line: str) -> process.Update | None:
++    key, _, value = line.strip().partition("=")
++    if key in ("out_time_us", "out_time_ms"):
++        # Both variants are in microseconds; N/A occurs before the first frame.
+         try:
+-            proc.wait(timeout=0.5)
+-            return
+-        except subprocess.TimeoutExpired:
+-            if cancelled():
+-                proc.kill()
+-                raise Cancelled("Render cancelled.") from None
++            return process.Update(int(value) / 1_000_000)
++        except ValueError:
++            return None
++    return None
++
++
++class FFmpegStalled(FFmpegError):
++    """The process stopped advancing its output timestamps."""
+diff --git a/backend/autoclip/pipeline/highlights.py b/backend/autoclip/pipeline/highlights.py
+--- a/backend/autoclip/pipeline/highlights.py
++++ b/backend/autoclip/pipeline/highlights.py
+@@ -16,8 +16,8 @@
+ from collections.abc import Callable
+ 
+ from ..db.models import Clip, new_id
+-from ..providers import ClipCandidate, DetectionConfig, LLMProvider, TranscriptWindow
+-from . import boundaries
++from ..providers import ClipCandidate, DetectionConfig, LLMProvider, ProviderError, TranscriptWindow
++from . import Cancelled, boundaries
+ from .prepare import Silence
+ from .transcript import Transcript
+ 
+@@ -34,6 +34,7 @@
+ #: saturating the GPU, so extra concurrency only adds contention.
+ HOSTED_CONCURRENCY = 3
+ LOCAL_CONCURRENCY = 1
++OLLAMA_WINDOW_WORDS = 360
+ 
+ 
+ class HighlightError(RuntimeError):
+@@ -45,6 +46,7 @@
+     *,
+     window_s: float = WINDOW_S,
+     overlap_s: float = OVERLAP_S,
++    max_words: int | None = None,
+ ) -> list[TranscriptWindow]:
+     """Split a transcript into overlapping windows.
+ 
+@@ -55,6 +57,8 @@
+         return []
+     if overlap_s >= window_s:
+         raise ValueError("overlap_s must be smaller than window_s")
++    if max_words is not None and max_words < 2:
++        raise ValueError("max_words must be at least two")
+ 
+     windows: list[TranscriptWindow] = []
+     total_words = len(transcript.words)
+@@ -65,7 +69,8 @@
+         window_end_time = window_start_time + window_s
+ 
+         last = cursor
+-        while last + 1 < total_words and transcript.words[last + 1].end <= window_end_time:
++        limit = min(total_words, cursor + max_words) if max_words is not None else total_words
++        while last + 1 < limit and transcript.words[last + 1].end <= window_end_time:
+             last += 1
+ 
+         windows.append(_make_window(transcript, cursor, last))
+@@ -76,6 +81,13 @@
+         # Step forward by (window - overlap), measured in time then converted
+         # back to a word index so overlap stays constant regardless of pace.
+         next_time = transcript.words[last].end - overlap_s
++        if max_words is not None:
++            # If a dense section fits fewer than 60 seconds into the word
++            # budget, still advance most of the window on every iteration.
++            next_time = max(
++                next_time,
++                transcript.words[last].end - (transcript.words[last].end - window_start_time) / 4,
++            )
+         next_cursor = transcript.index_at_time(next_time)
+         cursor = max(cursor + 1, next_cursor)
+ 
+@@ -127,9 +139,14 @@
+     job_id: str,
+     silences: list[Silence] | None = None,
+     on_progress: Callable[[float], None] | None = None,
++    on_detail: Callable[[float, str], None] | None = None,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> list[Clip]:
+     """Run detection across the whole transcript and return ranked clips."""
+-    windows = build_windows(transcript)
++    if cancelled and cancelled():
++        raise Cancelled("Seleção cancelada.")
++    local = provider.name == "ollama"
++    windows = build_windows(transcript, max_words=OLLAMA_WINDOW_WORDS if local else None)
+     if not windows:
+         raise HighlightError("The transcript is empty, so there is nothing to clip.")
+ 
+@@ -138,11 +155,17 @@
+     concurrency = LOCAL_CONCURRENCY if provider.name == "ollama" else HOSTED_CONCURRENCY
+     semaphore = asyncio.Semaphore(concurrency)
+     completed = 0
++    errors: list[Exception] = []
+     lock = asyncio.Lock()
+ 
+-    async def run_window(window: TranscriptWindow) -> list[ClipCandidate]:
++    async def run_window(index: int, window: TranscriptWindow) -> list[ClipCandidate]:
+         nonlocal completed
+         async with semaphore:
++            if on_detail:
++                on_detail(
++                    completed / len(windows),
++                    f"Analisando janela {index}/{len(windows)} ({provider.name})",
++                )
+             try:
+                 result = await provider.detect_highlights(window, config)
+                 candidates = result.clips
+@@ -154,17 +177,41 @@
+                     window.last_word,
+                     exc,
+                 )
++                errors.append(exc)
+                 candidates = []
+             async with lock:
+                 completed += 1
+                 if on_progress:
+                     on_progress(completed / len(windows))
++                if on_detail:
++                    on_detail(
++                        completed / len(windows), f"{completed}/{len(windows)} janelas analisadas"
++                    )
+             return candidates
+ 
+-    results = await asyncio.gather(*(run_window(w) for w in windows))
++    pending = asyncio.gather(*(run_window(i, w) for i, w in enumerate(windows, start=1)))
++    try:
++        while not pending.done():
++            if cancelled and cancelled():
++                raise Cancelled("Seleção cancelada.")
++            await asyncio.wait((pending,), timeout=0.25)
++        results = pending.result()
++    finally:
++        if not pending.done():
++            pending.cancel()
++            await asyncio.gather(pending, return_exceptions=True)
++    if cancelled and cancelled():
++        raise Cancelled("Seleção cancelada.")
+     candidates = [c for group in results for c in group]
+ 
+     if not candidates:
++        if errors:
++            last_error = errors[-1]
++            if isinstance(last_error, ProviderError):
++                raise HighlightError(
++                    f"Falha ao analisar com {provider.name}: {last_error}"
++                ) from last_error
++            log.warning("Sem candidatos e %d janelas com erro.", len(errors))
+         raise HighlightError(
+             "No clips were found. This can mean the video genuinely has no "
+             "self-contained highlights, or that the model struggled with the "
+diff --git a/backend/autoclip/pipeline/prepare.py b/backend/autoclip/pipeline/prepare.py
+--- a/backend/autoclip/pipeline/prepare.py
++++ b/backend/autoclip/pipeline/prepare.py
+@@ -1,15 +1,14 @@
+ """Prepare stage — normalise media into what later stages expect.
+ 
+-Produces a 16 kHz mono WAV (what Whisper wants), a thumbnail strip for UI
+-scrubbing, and a silence map used later to place clip boundaries in audio
+-troughs rather than mid-breath.
++Produces a 16 kHz mono WAV and a silence map for clip boundaries. Thumbnails
++are available to callers that need them; the pipeline player scrubs the source.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+ import re
+-import subprocess
++import wave
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -46,26 +45,54 @@
+     *,
+     duration_s: float | None = None,
+     on_progress: Callable[[float], None] | None = None,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> Path:
+     """Extract mono 16 kHz PCM WAV from any input."""
+     destination.parent.mkdir(parents=True, exist_ok=True)
+-    ffmpeg.run(
+-        [
+-            "-i",
+-            str(source),
+-            "-vn",
+-            "-ac",
+-            "1",
+-            "-ar",
+-            str(AUDIO_SAMPLE_RATE),
+-            "-c:a",
+-            "pcm_s16le",
+-            str(destination),
+-        ],
+-        total_duration_s=duration_s,
+-        on_progress=on_progress,
+-    )
++    partial = destination.with_suffix(".part.wav")
++    try:
++        ffmpeg.run(
++            [
++                "-i",
++                str(source),
++                "-vn",
++                "-ac",
++                "1",
++                "-ar",
++                str(AUDIO_SAMPLE_RATE),
++                "-c:a",
++                "pcm_s16le",
++                str(partial),
++            ],
++            total_duration_s=duration_s,
++            on_progress=on_progress,
++            cancelled=cancelled,
++        )
++        if audio_duration(partial) is None:
++            raise ffmpeg.FFmpegError("O WAV gerado está incompleto ou vazio.", command=[])
++        partial.replace(destination)
++    finally:
++        partial.unlink(missing_ok=True)
+     return destination
++
++
++def audio_duration(path: Path) -> float | None:
++    """Accept an intact PCM file, including completed WAVs from older jobs."""
++    try:
++        with wave.open(str(path), "rb") as wav:
++            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (
++                1,
++                2,
++                AUDIO_SAMPLE_RATE,
++            ):
++                return None
++            frames = wav.getnframes()
++            if frames <= 0 or path.stat().st_size < frames * 2:
++                return None
++            wav.setpos(frames - 1)
++            return frames / AUDIO_SAMPLE_RATE if len(wav.readframes(1)) == 2 else None
++    except (EOFError, OSError, wave.Error):
++        return None
+ 
+ 
+ def generate_thumbnails(
+@@ -112,6 +139,9 @@
+     *,
+     noise_db: float = -32.0,
+     min_duration_s: float = 0.20,
++    duration_s: float | None = None,
++    on_progress: Callable[[float], None] | None = None,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> list[Silence]:
+     """Find silent spans using ffmpeg's ``silencedetect``.
+ 
+@@ -122,28 +152,11 @@
+     Preconditions:
+         audio is a decodable audio file; video inputs work but waste decode time.
+     """
+-    command = [
+-        ffmpeg.ffmpeg_path(),
+-        "-hide_banner",
+-        "-nostdin",
+-        "-i",
+-        str(audio),
+-        "-af",
+-        f"silencedetect=noise={noise_db}dB:d={min_duration_s}",
+-        "-f",
+-        "null",
+-        "-",
+-    ]
+-    proc = subprocess.run(
+-        command, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace"
+-    )
+-    if proc.returncode != 0:
+-        log.warning("silencedetect failed; boundary refinement will fall back to fixed padding.")
+-        return []
+-
+     silences: list[Silence] = []
+     pending_start: float | None = None
+-    for line in (proc.stderr or "").splitlines():
++
++    def read_silence(line: str) -> None:
++        nonlocal pending_start
+         if match := _SILENCE_START.search(line):
+             pending_start = float(match.group(1))
+         elif match := _SILENCE_END.search(line):
+@@ -152,4 +165,26 @@
+             silences.append(Silence(start=max(0.0, start), end=end))
+             pending_start = None
+ 
++    try:
++        ffmpeg.run(
++            [
++                "-i",
++                str(audio),
++                "-vn",
++                "-af",
++                f"silencedetect=noise={noise_db}dB:d={min_duration_s}",
++                "-f",
++                "null",
++                "-",
++            ],
++            total_duration_s=duration_s,
++            on_progress=on_progress,
++            cancelled=cancelled,
++            on_stderr=read_silence,
++        )
++    except ffmpeg.FFmpegStalled:
++        raise
++    except ffmpeg.FFmpegError as exc:
++        log.warning("Análise de silêncio indisponível; usando margens fixas: %s", exc)
++        return []
+     return silences
+diff --git a/backend/autoclip/pipeline/process.py b/backend/autoclip/pipeline/process.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/pipeline/process.py
+@@ -0,0 +1,155 @@
++"""Monitor local media subprocesses without blocking on either output pipe."""
++
++from __future__ import annotations
++
++import logging
++import os
++import subprocess
++import threading
++import time
++from collections import deque
++from collections.abc import Callable, Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import TextIO
++
++from . import Cancelled
++
++log = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True)
++class Update:
++    position: float
++    message: str = ""
++
++
++@dataclass(frozen=True)
++class Result:
++    code: int
++    stderr: str
++    progress: Update
++    stalled: bool
++
++
++def run(
++    command: Sequence[str],
++    *,
++    label: str,
++    parse: Callable[[str], Update | None],
++    idle_timeout_s: float,
++    on_progress: Callable[[Update], None] | None = None,
++    cancelled: Callable[[], bool] | None = None,
++    cwd: Path | None = None,
++    on_stderr: Callable[[str], None] | None = None,
++    kill_tree: bool = False,
++) -> Result:
++    if cancelled and cancelled():
++        raise Cancelled("Processamento cancelado.")
++
++    latest = Update(0)
++    tail: deque[str] = deque(maxlen=40)
++    reader_error: Exception | None = None
++
++    def read_stdout(lines: TextIO) -> None:
++        nonlocal latest, reader_error
++        for line in lines:
++            try:
++                update = parse(line)
++                if update is not None and update.position >= latest.position:
++                    latest = update
++            except Exception as exc:
++                reader_error = exc
++
++    def read_stderr(lines: TextIO) -> None:
++        nonlocal reader_error
++        for line in lines:
++            tail.append(line.rstrip()[-2000:])
++            if on_stderr and reader_error is None:
++                try:
++                    on_stderr(line)
++                except Exception as exc:
++                    reader_error = exc
++
++    started_at = time.monotonic()
++    with subprocess.Popen(
++        command,
++        stdin=subprocess.DEVNULL,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++        cwd=cwd,
++    ) as child:
++        log.info("%s PID %d: %s", label, child.pid, subprocess.list2cmdline(command))
++        assert child.stdout is not None and child.stderr is not None
++        readers = [
++            threading.Thread(target=read_stdout, args=(child.stdout,), daemon=True),
++            threading.Thread(target=read_stderr, args=(child.stderr,), daemon=True),
++        ]
++        reported = Update(0)
++        last_advance = started_at
++        stalled = False
++        try:
++            for reader in readers:
++                reader.start()
++            while child.poll() is None:
++                if cancelled and cancelled():
++                    raise Cancelled("Processamento cancelado.")
++                update = latest
++                now = time.monotonic()
++                if update != reported:
++                    reported = update
++                    last_advance = now
++                    if on_progress:
++                        on_progress(update)
++                if now - last_advance >= idle_timeout_s:
++                    stalled = True
++                    break
++                try:
++                    child.wait(timeout=0.2)
++                except subprocess.TimeoutExpired:
++                    continue
++        finally:
++            if child.poll() is None:
++                _stop(child, kill_tree=kill_tree)
++            code = child.wait()
++            for reader in readers:
++                if reader.ident is not None:
++                    reader.join()
++            log.info(
++                "%s PID %d terminou em %.1f s (código %d, posição %.3f).",
++                label,
++                child.pid,
++                time.monotonic() - started_at,
++                code,
++                latest.position,
++            )
++            if tail and (code != 0 or label == "Whisper"):
++                log.info("Saída de %s PID %d:\n%s", label, child.pid, "\n".join(tail))
++
++    if reader_error:
++        raise reader_error
++    if cancelled and cancelled():
++        raise Cancelled("Processamento cancelado.")
++    if not stalled and code == 0 and latest != reported and on_progress:
++        on_progress(latest)
++    return Result(code, "\n".join(tail), latest, stalled)
++
++
++def _stop(child: subprocess.Popen[str], *, kill_tree: bool) -> None:
++    if os.name == "nt" and kill_tree:
++        # Python's Windows venv redirector can leave its child holding our pipes.
++        try:
++            subprocess.run(
++                ["taskkill.exe", "/PID", str(child.pid), "/T", "/F"],
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                timeout=5,
++                check=False,
++            )
++        except (OSError, subprocess.SubprocessError):
++            log.warning("Não foi possível encerrar a árvore do PID %d.", child.pid)
++    if child.poll() is None:
++        child.kill()
+diff --git a/backend/autoclip/pipeline/reframe/__init__.py b/backend/autoclip/pipeline/reframe/__init__.py
+--- a/backend/autoclip/pipeline/reframe/__init__.py
++++ b/backend/autoclip/pipeline/reframe/__init__.py
+@@ -18,6 +18,7 @@
+ from __future__ import annotations
+ 
+ import logging
++from collections.abc import Callable
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+@@ -82,6 +83,7 @@
+     end_s: float,
+     transcript: Transcript | None = None,
+     config: ReframeConfig | None = None,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> CropPath:
+     """Compute the crop path for one clip.
+ 
+@@ -108,7 +110,11 @@
+ 
+     try:
+         observations = sample_faces(
+-            video, start_s=start_s, end_s=end_s, sample_fps=config.sample_fps
++            video,
++            start_s=start_s,
++            end_s=end_s,
++            sample_fps=config.sample_fps,
++            cancelled=cancelled,
+         )
+     except FaceDetectionUnavailable as exc:
+         log.warning("Face detection unavailable (%s); using a centre crop.", exc)
+@@ -133,7 +139,7 @@
+         )
+ 
+     tracks = build_tracks(observations)
+-    shots = detect_shots(video, start_s=start_s, end_s=end_s)
++    shots = detect_shots(video, start_s=start_s, end_s=end_s, cancelled=cancelled)
+ 
+     turns = _clip_relative_turns(transcript, start_s, end_s)
+     speaker_map = map_tracks_to_speakers(tracks, turns) if turns else {}
+diff --git a/backend/autoclip/pipeline/reframe/croppath.py b/backend/autoclip/pipeline/reframe/croppath.py
+--- a/backend/autoclip/pipeline/reframe/croppath.py
++++ b/backend/autoclip/pipeline/reframe/croppath.py
+@@ -133,7 +133,9 @@
+ 
+     def save(self, path: Path) -> Path:
+         path.parent.mkdir(parents=True, exist_ok=True)
+-        path.write_text(json.dumps(self.to_dict()), encoding="utf-8")
++        partial = path.with_suffix(".json.part")
++        partial.write_text(json.dumps(self.to_dict()), encoding="utf-8")
++        partial.replace(path)
+         return path
+ 
+     @classmethod
+diff --git a/backend/autoclip/pipeline/reframe/faces.py b/backend/autoclip/pipeline/reframe/faces.py
+--- a/backend/autoclip/pipeline/reframe/faces.py
++++ b/backend/autoclip/pipeline/reframe/faces.py
+@@ -12,9 +12,11 @@
+ from __future__ import annotations
+ 
+ import logging
+-from collections.abc import Iterator
++from collections.abc import Callable, Iterator
+ from dataclasses import dataclass
+ from pathlib import Path
++
++from .. import Cancelled
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -90,6 +92,7 @@
+     end_s: float | None = None,
+     sample_fps: float = DEFAULT_SAMPLE_FPS,
+     max_faces: int = MAX_FACES,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> list[FaceObservation]:
+     """Sample the video and return every face observed, in clip-relative time.
+ 
+@@ -124,7 +127,9 @@
+     observations: list[FaceObservation] = []
+ 
+     with FaceLandmarker.create_from_options(options) as landmarker:
+-        for timestamp, frame, width, height in _iter_frames(cv2, video, start_s, end_s, sample_fps):
++        for timestamp, frame, width, height in _iter_frames(
++            cv2, video, start_s, end_s, sample_fps, cancelled
++        ):
+             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+             # VIDEO mode demands monotonically increasing integer milliseconds.
+             result = landmarker.detect_for_video(image, int(timestamp * 1000))
+@@ -139,7 +144,12 @@
+ 
+ 
+ def _iter_frames(
+-    cv2, video: Path, start_s: float, end_s: float | None, sample_fps: float
++    cv2,
++    video: Path,
++    start_s: float,
++    end_s: float | None,
++    sample_fps: float,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> Iterator[tuple[float, object, int, int]]:
+     """Yield ``(clip_relative_t, rgb_frame, width, height)`` at the sample rate."""
+     capture = cv2.VideoCapture(str(video))
+@@ -162,6 +172,8 @@
+         # Timestamps come from the frame index rather than CAP_PROP_POS_MSEC,
+         # which drifts on variable-frame-rate sources.
+         while True:
++            if cancelled and cancelled():
++                raise Cancelled("Enquadramento cancelado.")
+             ok, frame = capture.read()
+             if not ok:
+                 break
+diff --git a/backend/autoclip/pipeline/reframe/scenes.py b/backend/autoclip/pipeline/reframe/scenes.py
+--- a/backend/autoclip/pipeline/reframe/scenes.py
++++ b/backend/autoclip/pipeline/reframe/scenes.py
+@@ -7,8 +7,11 @@
+ from __future__ import annotations
+ 
+ import logging
++from collections.abc import Callable
+ from dataclasses import dataclass
+ from pathlib import Path
++
++from .. import Cancelled
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -42,6 +45,7 @@
+     end_s: float | None = None,
+     threshold: float = DEFAULT_THRESHOLD,
+     min_shot_s: float = MIN_SHOT_S,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> list[Shot]:
+     """Return shots within ``[start_s, end_s)``, in clip-relative seconds.
+ 
+@@ -51,7 +55,9 @@
+     duration = (end_s - start_s) if end_s is not None else None
+ 
+     try:
+-        shots = _detect_with_scenedetect(video, start_s, end_s, threshold)
++        shots = _detect_with_scenedetect(video, start_s, end_s, threshold, cancelled)
++    except Cancelled:
++        raise
+     except Exception as exc:
+         log.warning("Scene detection failed (%s); treating the clip as one shot.", exc)
+         shots = []
+@@ -63,7 +69,11 @@
+ 
+ 
+ def _detect_with_scenedetect(
+-    video: Path, start_s: float, end_s: float | None, threshold: float
++    video: Path,
++    start_s: float,
++    end_s: float | None,
++    threshold: float,
++    cancelled: Callable[[], bool] | None = None,
+ ) -> list[Shot]:
+     from scenedetect import ContentDetector, SceneManager, open_video
+ 
+@@ -74,7 +84,13 @@
+     if start_s > 0:
+         stream.seek(start_s)
+ 
+-    manager.detect_scenes(video=stream, end_time=end_s, show_progress=False)
++    def check(_image, _frame) -> None:
++        if cancelled and cancelled():
++            manager.stop()
++
++    manager.detect_scenes(video=stream, end_time=end_s, show_progress=False, callback=check)
++    if cancelled and cancelled():
++        raise Cancelled("Enquadramento cancelado.")
+     scenes = manager.get_scene_list()
+ 
+     shots: list[Shot] = []
+diff --git a/backend/autoclip/pipeline/runner.py b/backend/autoclip/pipeline/runner.py
+--- a/backend/autoclip/pipeline/runner.py
++++ b/backend/autoclip/pipeline/runner.py
+@@ -12,20 +12,23 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextlib
+ import json
+ import logging
++import threading
++import time
+ from collections.abc import Callable
+ from dataclasses import dataclass
++from logging.handlers import RotatingFileHandler
+ from pathlib import Path
+ 
+ from .. import paths
+-from ..config import Settings
+-from ..config import load as load_settings
++from ..config import Settings, for_job
+ from ..db import store
+ from ..db.models import Clip, Export, Job, Source, new_id, utcnow
+ from ..db.models import Transcript as TranscriptRow
+-from ..providers import build_provider, detection_config
+-from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
++from ..providers import OllamaProvider, build_provider, detection_config
++from . import Cancelled, Stage, captions, export, ffmpeg, highlights, prepare, transcribe
+ from .prepare import Silence
+ from .reframe import ReframeConfig, build_crop_path
+ from .reframe.croppath import CropPath
+@@ -45,7 +48,7 @@
+ }
+ 
+ 
+-class JobCancelled(RuntimeError):
++class JobCancelled(Cancelled):
+     """The job was cancelled by the user."""
+ 
+ 
+@@ -75,7 +78,6 @@
+ 
+     def __init__(self, job_id: str) -> None:
+         self.root = paths.job_work_dir(job_id)
+-        self.root.mkdir(parents=True, exist_ok=True)
+ 
+     @property
+     def audio(self) -> Path:
+@@ -89,16 +91,16 @@
+     def silences(self) -> Path:
+         return self.root / "silences.json"
+ 
+-    @property
+-    def thumbnails(self) -> Path:
+-        return self.root / "thumbnails"
+-
+     def crop_path(self, clip_id: str) -> Path:
+         return self.root / "crops" / f"{clip_id}.json"
+ 
+     @property
+     def captions_dir(self) -> Path:
+         return self.root / "captions"
++
++    @property
++    def log_file(self) -> Path:
++        return self.root / "pipeline.log"
+ 
+ 
+ class PipelineRunner:
+@@ -115,11 +117,15 @@
+     ) -> None:
+         self.job = job
+         self.source = source
+-        self.settings = settings or load_settings()
++        self.settings = settings or for_job(job.settings)
+         self.on_progress = on_progress
+         self._is_cancelled = is_cancelled or (lambda: False)
+         self.workspace = JobWorkspace(job.id)
++        self.workspace.root.mkdir(parents=True, exist_ok=True)
+         self._completed_weight = 0.0
++        self._last_event: ProgressEvent | None = None
++        self._last_update = 0.0
++        self._started_stage = 0.0
+ 
+     # -- progress ----------------------------------------------------------
+ 
+@@ -135,19 +141,44 @@
+         *,
+         overall: float | None = None,
+     ) -> None:
++        stage_progress = min(1.0, max(0.0, stage_progress))
++        previous = self._last_event
++        if previous and previous.stage == stage:
++            stage_progress = max(previous.stage_progress, stage_progress)
+         if overall is None:
+             overall = self._completed_weight + STAGE_WEIGHTS[stage] * stage_progress
+-        overall = min(1.0, overall)
+-        store.update_job(self.job.id, current_stage=stage.value, progress=round(overall, 4))
++        event = ProgressEvent(
++            stage, stage_progress, round(min(1.0, overall), 4), message or stage.label
++        )
++        now = time.monotonic()
++        if previous and event == previous:
++            return
++        detail_changed = previous is None or (previous.stage, previous.message) != (
++            stage,
++            event.message,
++        )
++        finished = stage_progress == 1.0 and (
++            previous is None or previous.stage_progress < 1 or previous.stage != stage
++        )
++        if not detail_changed and not finished and now - self._last_update < 0.5:
++            return
++        if previous is None or previous.stage != stage:
++            self._started_stage = now
++        if detail_changed:
++            log.info("%s | %.1f%% | %s", stage.value, stage_progress * 100, event.message)
++        if finished:
++            log.info("%s concluída em %.1f s.", stage.value, now - self._started_stage)
++        self._last_event = event
++        self._last_update = now
++        store.update_job(
++            self.job.id,
++            current_stage=stage.value,
++            progress=event.overall,
++            stage_progress=stage_progress,
++            progress_message=event.message,
++        )
+         if self.on_progress:
+-            self.on_progress(
+-                ProgressEvent(
+-                    stage=stage,
+-                    stage_progress=stage_progress,
+-                    overall=overall,
+-                    message=message or stage.label,
+-                )
+-            )
++            self.on_progress(event)
+ 
+     def _finish_stage(self, stage: Stage) -> None:
+         """Mark a stage complete.
+@@ -160,29 +191,60 @@
+         self._completed_weight += STAGE_WEIGHTS[stage]
+         self._emit(stage, 1.0, overall=self._completed_weight)
+ 
+-    def _stage_progress(self, stage: Stage) -> Callable[[float], None]:
+-        def report(fraction: float) -> None:
+-            self._emit(stage, max(0.0, min(1.0, fraction)))
+-
+-        return report
+-
+     # -- entry point -------------------------------------------------------
+ 
+     async def run(self) -> list[Clip]:
+         """Run the full pipeline and return the exported clips."""
+-        store.update_job(self.job.id, status="running", started_at=utcnow(), error=None)
+-
++        with self._log_to_workspace():
++            return await self._run()
++
++    @contextlib.contextmanager
++    def _log_to_workspace(self):
++        logger = logging.getLogger("autoclip.pipeline")
++        handler = RotatingFileHandler(
++            self.workspace.log_file,
++            maxBytes=1_000_000,
++            backupCount=2,
++            encoding="utf-8",
++        )
++        thread_id = threading.get_ident()
++        handler.addFilter(lambda record: record.thread == thread_id)
++        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
++        previous_level = logger.level
++        logger.setLevel(logging.INFO)
++        logger.addHandler(handler)
+         try:
+-            audio = self._stage_prepare()
++            yield
++        finally:
++            logger.removeHandler(handler)
++            logger.setLevel(previous_level)
++            handler.close()
++
++    async def _run(self) -> list[Clip]:
++        store.update_job(
++            self.job.id, status="running", started_at=utcnow(), finished_at=None, error=None
++        )
++        try:
++            source = Path(self.source.path)
++            log.info(
++                "Tarefa %s; origem %s; %.1f s; %.1f MiB; Whisper %s; saída %s.",
++                self.job.id,
++                self.source.id,
++                self.source.duration_s,
++                source.stat().st_size / (1024 * 1024) if source.is_file() else 0,
++                self.settings.whisper.model,
++                self.settings.export.resolution,
++            )
++            audio, silences = self._stage_prepare()
+             transcript = self._stage_transcribe(audio)
+-            silences = self._load_or_detect_silences(audio)
+             clips = await self._stage_highlights(transcript, silences)
+             crop_paths = self._stage_reframe(clips, transcript)
+             self._stage_captions(clips, transcript)
+             self._stage_export(clips, transcript, crop_paths)
+-        except JobCancelled:
+-            store.update_job(self.job.id, status="cancelled", finished_at=utcnow(), progress=0.0)
+-            raise
++        except Cancelled as exc:
++            log.info("Tarefa %s cancelada. Arquivos concluídos foram preservados.", self.job.id)
++            store.update_job(self.job.id, status="cancelled", finished_at=utcnow())
++            raise JobCancelled("Processamento cancelado.") from exc
+         except Exception as exc:
+             log.exception("Job %s failed.", self.job.id)
+             store.update_job(self.job.id, status="failed", error=str(exc), finished_at=utcnow())
+@@ -193,54 +255,80 @@
+ 
+     # -- stages ------------------------------------------------------------
+ 
+-    def _stage_prepare(self) -> Path:
++    def _stage_prepare(self) -> tuple[Path, list[Silence]]:
+         stage = Stage.PREPARE
+         self._check_cancelled()
+         source_path = Path(self.source.path)
+-
+-        if self.workspace.audio.exists() and self.workspace.audio.stat().st_size > 0:
+-            log.info("Reusing existing audio for job %s.", self.job.id)
+-        else:
+-            self._emit(stage, 0.0, "Extracting audio")
++        self._emit(stage, 0.0, "Conferindo a mídia e o áudio salvo")
++        if not source_path.is_file():
++            raise PipelineError(
++                "O arquivo de origem está ausente. Confira o caminho do vídeo.", stage=stage
++            )
++
++        audio = self.workspace.audio
++        media = ffmpeg.probe(source_path)
++        if not media.has_audio:
++            raise PipelineError("A origem não contém uma faixa de áudio.", stage=stage)
++        expected = media.audio_duration_s
++        duration = prepare.audio_duration(audio)
++        extracted = duration is None or (expected is not None and duration < expected - 2)
++        if extracted:
++            self._emit(stage, 0.0, "Extraindo áudio para WAV mono")
+             prepare.extract_audio(
+                 source_path,
+-                self.workspace.audio,
+-                duration_s=self.source.duration_s,
+-                on_progress=self._stage_progress(stage),
+-            )
+-
+-        if self.source.has_video and not self.workspace.thumbnails.exists():
+-            prepare.generate_thumbnails(source_path, self.workspace.thumbnails)
+-
++                audio,
++                duration_s=expected or self.source.duration_s,
++                on_progress=lambda fraction: self._emit(
++                    stage, fraction * 0.8, "Extraindo áudio para WAV mono"
++                ),
++                cancelled=self._is_cancelled,
++            )
++            duration = prepare.audio_duration(audio)
++        else:
++            self._emit(stage, 0.8, f"Reaproveitando WAV completo ({duration:.1f} s)")
++
++        silences = self._load_or_detect_silences(audio, duration, refresh=extracted)
+         self._finish_stage(stage)
+-        return self.workspace.audio
++        return audio, silences
+ 
+     def _stage_transcribe(self, audio: Path) -> Transcript:
+         stage = Stage.TRANSCRIBE
+         self._check_cancelled()
+ 
+-        if self.workspace.transcript.exists():
+-            log.info("Reusing existing transcript for job %s.", self.job.id)
+-            transcript = Transcript.load(self.workspace.transcript)
+-            self._finish_stage(stage)
+-            return transcript
+-
+-        self._emit(stage, 0.0, "Transcribing")
+-        transcript = transcribe.transcribe(
+-            audio,
+-            self.settings.whisper,
+-            duration_s=self.source.duration_s,
+-            on_progress=self._stage_progress(stage),
+-            cancelled=self._is_cancelled,
+-        )
+-
+-        if self.settings.whisper.diarization:
+-            from ..config import HF_TOKEN_KEY, get_secret
+-
+-            self._emit(stage, 0.95, "Identifying speakers")
+-            transcribe.diarize(audio, transcript, hf_token=get_secret(HF_TOKEN_KEY, self.settings))
+-
+-        transcript.save(self.workspace.transcript)
++        whisper = self.settings.whisper
++        transcript = transcribe.load_checkpoint(self.workspace.transcript)
++        if transcript is not None and transcript.words:
++            self._emit(stage, 0.0, f"Reaproveitando transcrição ({len(transcript.words)} palavras)")
++        else:
++            self._emit(stage, 0.0, "Iniciando o Whisper")
++            weight = 0.95 if whisper.diarization else 0.99
++            ollama_settings = self.settings.provider("ollama")
++
++            def release_ollama() -> bool:
++                provider = OllamaProvider(ollama_settings.model, base_url=ollama_settings.base_url)
++                released = provider.unload()
++                if not released:
++                    self._emit(stage, 0.0, "Ollama ainda ocupa a GPU. Usando Whisper em CPU")
++                return released
++
++            transcript = transcribe.transcribe(
++                audio,
++                whisper,
++                duration_s=self.source.duration_s,
++                cancelled=self._is_cancelled,
++                checkpoint_dir=self.workspace.root / "whisper-blocks",
++                on_detail=lambda fraction, message: self._emit(stage, fraction * weight, message),
++                before_cuda=release_ollama,
++            )
++            if whisper.diarization:
++                from ..config import HF_TOKEN_KEY, get_secret
++
++                self._emit(stage, 0.95, "Identificando vozes")
++                transcribe.diarize(
++                    audio, transcript, hf_token=get_secret(HF_TOKEN_KEY, self.settings)
++                )
++                self._check_cancelled()
++            transcript.save(self.workspace.transcript)
+         store.upsert_transcript(
+             TranscriptRow(
+                 job_id=self.job.id,
+@@ -256,16 +344,39 @@
+         self._finish_stage(stage)
+         return transcript
+ 
+-    def _load_or_detect_silences(self, audio: Path) -> list[Silence]:
+-        if self.workspace.silences.exists():
+-            raw = json.loads(self.workspace.silences.read_text(encoding="utf-8"))
+-            return [Silence(**item) for item in raw]
+-
+-        silences = prepare.detect_silences(audio)
+-        self.workspace.silences.write_text(
++    def _load_or_detect_silences(
++        self,
++        audio: Path,
++        duration: float | None,
++        *,
++        refresh: bool,
++    ) -> list[Silence]:
++        cache = self.workspace.silences
++        if not refresh and cache.exists() and cache.stat().st_mtime_ns >= audio.stat().st_mtime_ns:
++            try:
++                raw = json.loads(cache.read_text(encoding="utf-8"))
++                silences = [Silence(**item) for item in raw]
++            except (OSError, ValueError, TypeError) as exc:
++                log.warning("Mapa de silêncio inválido; calculando novamente: %s", exc)
++            else:
++                self._emit(Stage.PREPARE, 0.99, "Reaproveitando análise de silêncios")
++                return silences
++
++        self._emit(Stage.PREPARE, 0.8, "Localizando pausas no áudio")
++        silences = prepare.detect_silences(
++            audio,
++            duration_s=duration,
++            cancelled=self._is_cancelled,
++            on_progress=lambda fraction: self._emit(
++                Stage.PREPARE, 0.8 + fraction * 0.19, "Localizando pausas no áudio"
++            ),
++        )
++        partial = cache.with_suffix(".json.part")
++        partial.write_text(
+             json.dumps([{"start": s.start, "end": s.end} for s in silences]),
+             encoding="utf-8",
+         )
++        partial.replace(cache)
+         return silences
+ 
+     async def _stage_highlights(
+@@ -277,6 +388,7 @@
+         existing = store.list_clips(self.job.id)
+         if existing:
+             log.info("Reusing %d existing clips for job %s.", len(existing), self.job.id)
++            self._emit(stage, 0.0, f"Reaproveitando {len(existing)} cortes selecionados")
+             self._finish_stage(stage)
+             return existing
+ 
+@@ -284,15 +396,20 @@
+         provider = build_provider(provider_name, self.settings)
+         config = detection_config(self.settings)
+ 
+-        self._emit(stage, 0.0, f"Finding highlights with {provider.name}")
+-        clips = await highlights.detect(
+-            transcript,
+-            provider,
+-            config,
+-            job_id=self.job.id,
+-            silences=silences,
+-            on_progress=self._stage_progress(stage),
+-        )
++        self._emit(stage, 0.0, f"Iniciando a seleção com {provider.name}")
++        try:
++            clips = await highlights.detect(
++                transcript,
++                provider,
++                config,
++                job_id=self.job.id,
++                silences=silences,
++                on_detail=lambda fraction, message: self._emit(stage, fraction, message),
++                cancelled=self._is_cancelled,
++            )
++        finally:
++            if isinstance(provider, OllamaProvider):
++                provider.unload()
+ 
+         store.replace_clips(self.job.id, clips)
+         self._finish_stage(stage)
+@@ -308,6 +425,7 @@
+         if not self.source.has_video:
+             # Audio-only sources render as captions on a solid background, so
+             # there is nothing to reframe.
++            self._emit(stage, 0.0, "A origem contém apenas áudio")
+             self._finish_stage(stage)
+             return crop_paths
+ 
+@@ -317,23 +435,37 @@
+         )
+         if self.settings.export.ratio == "16:9":
+             config = ReframeConfig(aspect_w=16, aspect_h=9)
++        config.centre_only = getattr(self.settings.export, "centre_crop", False)
+ 
+         for index, clip in enumerate(clips):
+             self._check_cancelled()
++            self._emit(
++                stage,
++                index / len(clips),
++                f"Analisando enquadramento do corte {index + 1}/{len(clips)}",
++            )
+             cached = self.workspace.crop_path(clip.id)
+-            if cached.exists():
+-                crop_paths[clip.id] = CropPath.load(cached)
+-            else:
++            try:
++                crop_path = CropPath.load(cached) if cached.is_file() else None
++            except (OSError, TypeError, ValueError, KeyError, AttributeError) as exc:
++                log.warning("Enquadramento salvo inválido; recalculando: %s", exc)
++                crop_path = None
++            if crop_path is None or not crop_path.segments:
+                 crop_paths[clip.id] = build_crop_path(
+                     source_path,
+                     start_s=clip.start_s,
+                     end_s=clip.end_s,
+                     transcript=transcript,
+                     config=config,
++                    cancelled=self._is_cancelled,
+                 )
+                 crop_paths[clip.id].save(cached)
+-
+-            self._emit(stage, (index + 1) / len(clips), f"Reframing clip {index + 1}")
++            else:
++                crop_paths[clip.id] = crop_path
++
++            self._emit(
++                stage, (index + 1) / len(clips), f"Enquadramento {index + 1}/{len(clips)} concluído"
++            )
+ 
+         self._finish_stage(stage)
+         return crop_paths
+@@ -341,6 +473,7 @@
+     def _stage_captions(self, clips: list[Clip], transcript: Transcript) -> None:
+         stage = Stage.CAPTIONS
+         self._check_cancelled()
++        self._emit(stage, 0.0, "Conferindo o estilo das legendas")
+         # Caption files are written during export, where the output dimensions
+         # are known. This stage validates the style so a typo fails fast rather
+         # than after the reframe work is already done.
+@@ -358,6 +491,7 @@
+ 
+         style = captions.get_style(self.settings.export.caption_style)
+         ratio = self.settings.export.ratio
++        resolution = self.settings.export.resolution
+         source_path = Path(self.source.path)
+         destination_dir = paths.exports_dir() / self.job.id
+         destination_dir.mkdir(parents=True, exist_ok=True)
+@@ -365,11 +499,36 @@
+         for index, clip in enumerate(clips):
+             self._check_cancelled()
+ 
++            destination = destination_dir / export.output_filename(
++                f"{clip.rank}-{clip.title or 'clip'}",
++                ratio,
++                resolution,
++            )
++            previous_exports = store.list_exports(clip.id)
++            legacy = destination_dir / export.output_filename(
++                clip.title or f"clip-{clip.rank}", ratio
++            )
++            eligible_paths = {destination}
++            if resolution == "1080p" and not clip.user_trimmed:
++                eligible_paths.add(legacy)
++            if any(
++                record.ratio == ratio
++                and record.style == style.key
++                and record.size_bytes > 0
++                and (rendered := Path(record.path)) in eligible_paths
++                and rendered.is_file()
++                and rendered.stat().st_size == record.size_bytes
++                for record in previous_exports
++            ):
++                if clip.status == "candidate":
++                    store.update_clip(clip.id, status="exported")
++                self._emit(
++                    stage, (index + 1) / len(clips), f"Reaproveitando render do corte {index + 1}"
++                )
++                continue
++
+             crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
+             words = transcript.slice(clip.start_word, clip.end_word)
+-            destination = destination_dir / export.output_filename(
+-                clip.title or f"clip-{clip.rank}", ratio
+-            )
+ 
+             request = export.ExportRequest(
+                 source=source_path,
+@@ -382,15 +541,18 @@
+                 ratio=ratio,
+             )
+ 
+-            def clip_progress(fraction: float, i: int = index) -> None:
+-                self._emit(stage, (i + fraction) / len(clips), f"Exporting clip {i + 1}")
++            self._emit(stage, index / len(clips), f"Preparando o corte {index + 1}/{len(clips)}")
+ 
+             export.export_clip(
+                 request,
+                 work_dir=self.workspace.captions_dir,
+                 settings=self.settings.export,
+-                on_progress=clip_progress,
+                 cancelled=self._is_cancelled,
++                on_detail=lambda fraction, encoder, i=index: self._emit(
++                    stage,
++                    (i + min(fraction, 0.99)) / len(clips),
++                    f"Renderizando corte {i + 1}/{len(clips)} · {resolution} · {encoder}",
++                ),
+             )
+ 
+             store.create_export(
+@@ -404,6 +566,9 @@
+                 )
+             )
+             store.update_clip(clip.id, status="exported")
++            self._emit(
++                stage, (index + 1) / len(clips), f"Corte {index + 1}/{len(clips)} renderizado"
++            )
+ 
+         self._finish_stage(stage)
+ 
+diff --git a/backend/autoclip/pipeline/transcribe.py b/backend/autoclip/pipeline/transcribe.py
+--- a/backend/autoclip/pipeline/transcribe.py
++++ b/backend/autoclip/pipeline/transcribe.py
+@@ -7,15 +7,30 @@
+ 
+ from __future__ import annotations
+ 
++import argparse
++import contextlib
++import hashlib
++import json
+ import logging
++import math
++import sys
++import tempfile
++import wave
+ from collections.abc import Callable
++from dataclasses import replace
+ from pathlib import Path
+ 
+ from ..config import WhisperSettings
+-from ..system import GPUInfo, report
++from ..system import GPUInfo, probe_gpu, query_compute_types
++from . import process
++from .prepare import AUDIO_SAMPLE_RATE, audio_duration
+ from .transcript import Segment, Transcript, Word
+ 
+ log = logging.getLogger(__name__)
++BLOCK_SECONDS = 120
++OVERLAP_SECONDS = 2
++IDLE_TIMEOUT_S = 300.0
++CUDA_FALLBACK_CODE = 42
+ 
+ 
+ class TranscriptionError(RuntimeError):
+@@ -30,7 +45,10 @@
+     message that points at cuDNN rather than at the setting, so an unsupported
+     override is warned about and ignored rather than honoured into a crash.
+     """
+-    gpu = gpu if gpu is not None else report().gpu
++    if settings.device == "cpu":
++        gpu = GPUInfo(supported_compute_types=query_compute_types("cpu"))
++    elif gpu is None:
++        gpu = probe_gpu()
+     automatic = gpu.compute_type
+ 
+     override = settings.compute_type
+@@ -52,36 +70,6 @@
+     return gpu.device, override
+ 
+ 
+-def _model_load_error(exc: Exception, device: str, compute_type: str) -> TranscriptionError:
+-    """Turn a Whisper model-load failure into something actionable.
+-
+-    The two causes look identical from the outside and need opposite fixes, so
+-    they're distinguished rather than lumped under one guess.
+-    """
+-    message = str(exc)
+-    lowered = message.lower()
+-
+-    if "compute type" in lowered or "not support" in lowered:
+-        supported = report().gpu.supported_compute_types
+-        options = ", ".join(sorted(supported)) if supported else "unknown"
+-        return TranscriptionError(
+-            f"This device does not support the '{compute_type}' compute type.\n"
+-            f"Supported on {device}: {options}.\n\n"
+-            "Clear whisper.compute_type in config.json to let AutoClip choose, "
+-            "or set it to one of the supported values."
+-        )
+-
+-    if device == "cuda" and ("cudnn" in lowered or "library" in lowered or "dll" in lowered):
+-        return TranscriptionError(
+-            f"Could not load Whisper on the GPU: {message}\n\n"
+-            "This is a missing CUDA runtime library. Install it with "
+-            "`uv pip install 'autoclip[gpu]'`, then retry — the job resumes "
+-            "from this stage."
+-        )
+-
+-    return TranscriptionError(f"Could not load the Whisper model: {message}")
+-
+-
+ def transcribe(
+     audio: Path,
+     settings: WhisperSettings | None = None,
+@@ -89,44 +77,235 @@
+     duration_s: float | None = None,
+     on_progress: Callable[[float], None] | None = None,
+     cancelled: Callable[[], bool] | None = None,
++    on_detail: Callable[[float, str], None] | None = None,
++    checkpoint_dir: Path | None = None,
++    before_cuda: Callable[[], bool] | None = None,
+ ) -> Transcript:
+-    """Transcribe an audio file into a :class:`Transcript` with word timings.
+-
+-    Preconditions:
+-        audio is a decodable audio file, ideally 16 kHz mono as produced by
+-        :func:`autoclip.pipeline.prepare.extract_audio`.
+-    """
+-    settings = settings or WhisperSettings()
+-
+-    # Must happen before faster-whisper pulls in CTranslate2, which resolves its
+-    # CUDA dependencies at import.
+-    from ..cuda import ensure_cuda_libraries
+-
+-    ensure_cuda_libraries()
+-
+-    try:
+-        from faster_whisper import WhisperModel
+-    except ImportError as exc:  # pragma: no cover - faster-whisper is a core dep
++    """Run Whisper in a child process so a blocked inference can be cancelled."""
++    settings = settings or WhisperSettings(device="cpu")
++    temp_parent = checkpoint_dir.parent if checkpoint_dir else None
++    if temp_parent:
++        temp_parent.mkdir(parents=True, exist_ok=True)
++    with tempfile.TemporaryDirectory(prefix="whisper-", dir=temp_parent) as temp:
++        output = Path(temp) / "transcript.json"
++        command = [
++            sys.executable,
++            "-u",
++            "-m",
++            "autoclip.pipeline.transcribe",
++            str(audio),
++            str(output),
++        ]
++        if duration_s:
++            command.extend(("--duration", str(duration_s)))
++        if checkpoint_dir:
++            command.extend(("--checkpoints", str(checkpoint_dir)))
++
++        def report_progress(update: process.Update) -> None:
++            if on_progress:
++                on_progress(update.position)
++            if on_detail:
++                on_detail(update.position, update.message)
++
++        def run_worker(selected: WhisperSettings) -> process.Result:
++            args = [*command, "--settings", selected.model_dump_json()]
++            return process.run(
++                args,
++                label="Whisper",
++                parse=_parse_progress,
++                idle_timeout_s=IDLE_TIMEOUT_S,
++                on_progress=report_progress,
++                cancelled=cancelled,
++                kill_tree=True,
++            )
++
++        if settings.device != "cpu" and before_cuda and not before_cuda():
++            settings = settings.model_copy(update={"device": "cpu"})
++        result = run_worker(settings)
++        if result.code == CUDA_FALLBACK_CODE and settings.device != "cpu":
++            report_progress(process.Update(0, "CUDA indisponível. Continuando em CPU"))
++            cpu = settings.model_copy(update={"device": "cpu"})
++            result = run_worker(cpu)
++        if result.stalled:
++            raise TranscriptionError(
++                f"Whisper ficou {IDLE_TIMEOUT_S:g} s sem avançar. "
++                "Tente novamente para reaproveitar os blocos já concluídos."
++            )
++        if result.code != 0:
++            tail = result.stderr.strip().splitlines()
++            detail = tail[-1] if tail else f"código {result.code}"
++            raise TranscriptionError(f"Falha na transcrição: {detail}")
++        return Transcript.load(output)
++
++
++def _parse_progress(line: str) -> process.Update | None:
++    if not line.startswith("{"):
++        return None  # a native library can also write to stdout
++    try:
++        data = json.loads(line)
++        return process.Update(float(data["position"]), str(data["message"]))
++    except (ValueError, KeyError, TypeError):
++        return None
++
++
++def _transcribe_audio(
++    audio: Path,
++    settings: WhisperSettings,
++    *,
++    duration_s: float | None,
++    checkpoint_dir: Path,
++    emit: Callable[[float, str], None],
++) -> Transcript:
++    device, compute_type = resolve_compute(settings)
++    emit(0, f"Carregando Whisper {settings.model} ({device.upper()}, {compute_type})")
++    try:
++        return _run_blocks(audio, settings, device, compute_type, duration_s, checkpoint_dir, emit)
++    except (OSError, RuntimeError, ValueError) as exc:
++        if device != "cuda" or not any(
++            term in str(exc).lower()
++            for term in ("cuda", "cublas", "cudnn", "dll", "out of memory", "compute type")
++        ):
++            raise
++        log.warning("CUDA indisponível para Whisper; continuando em CPU: %s", exc)
++        raise SystemExit(CUDA_FALLBACK_CODE) from exc
++
++
++def _run_blocks(
++    audio, settings, device, compute_type, duration_s, checkpoint_dir, emit
++) -> Transcript:
++    from faster_whisper import WhisperModel
++
++    model = None
++    log.info("Modelo=%s dispositivo=%s precisão=%s", settings.model, device, compute_type)
++
++    def transcribe_block(samples, language, offset, start, end, on_progress):
++        nonlocal model
++        if model is None:
++            model = WhisperModel(settings.model, device=device, compute_type=compute_type)
++        return _decode(model, samples, language, offset, start, end, on_progress)
++
++    try:
++        if audio_duration(audio) is not None:
++            transcript = _transcribe_wav(
++                audio,
++                settings,
++                device,
++                checkpoint_dir,
++                emit,
++                transcribe_block,
++            )
++        else:
++            # Standalone callers can pass a media container directly.
++            def report_seconds(seconds: float) -> None:
++                if duration_s:
++                    emit(min(0.99, seconds / duration_s), "Transcrevendo áudio")
++
++            transcript = transcribe_block(
++                str(audio),
++                settings.language,
++                0.0,
++                0.0,
++                math.inf,
++                report_seconds,
++            )
++            transcript.model = settings.model
++    finally:
++        if device == "cuda" and model is not None:
++            with contextlib.suppress(RuntimeError):
++                model.model.unload_model()
++
++    if not transcript.words:
+         raise TranscriptionError(
+-            "faster-whisper is not installed. Run `autoclip doctor` for details."
+-        ) from exc
+-
+-    device, compute_type = resolve_compute(settings)
+-    log.info(
+-        "Transcribing with model=%s device=%s compute_type=%s",
++            "Nenhuma fala foi detectada. Confira a faixa de áudio ou tente um modelo Whisper maior."
++        )
++    return transcript
++
++
++def _transcribe_wav(audio, settings, device, checkpoint_dir, emit, transcribe_block) -> Transcript:
++    import numpy as np
++
++    transcript = Transcript(language=settings.language, model=settings.model)
++    info = audio.stat()
++    identity = (
++        str(audio.resolve()),
++        info.st_size,
++        info.st_mtime_ns,
+         settings.model,
+-        device,
+-        compute_type,
++        settings.language,
++        BLOCK_SECONDS,
++        OVERLAP_SECONDS,
+     )
+-
+-    try:
+-        model = WhisperModel(settings.model, device=device, compute_type=compute_type)
+-    except Exception as exc:
+-        raise _model_load_error(exc, device, compute_type) from exc
+-
+-    segments_iter, info = model.transcribe(
+-        str(audio),
+-        language=settings.language or None,
++    cache = checkpoint_dir / hashlib.sha256(repr(identity).encode()).hexdigest()[:20]
++    with wave.open(str(audio), "rb") as wav:
++        total_frames = wav.getnframes()
++        block_frames = BLOCK_SECONDS * AUDIO_SAMPLE_RATE
++        overlap = OVERLAP_SECONDS * AUDIO_SAMPLE_RATE
++        count = math.ceil(total_frames / block_frames)
++        for index, start in enumerate(range(0, total_frames, block_frames), start=1):
++            end = min(start + block_frames, total_frames)
++            message = f"Transcrevendo bloco {index}/{count} ({device.upper()})"
++            checkpoint = cache / f"{index:05d}.json"
++            block = load_checkpoint(checkpoint)
++            if block is None:
++                emit(start / total_frames, message)
++                left = max(0, start - overlap)
++                right = min(total_frames, end + overlap)
++                wav.setpos(left)
++                samples = np.frombuffer(wav.readframes(right - left), dtype="<i2").astype(
++                    np.float32
++                )
++                samples /= 32768
++
++                def report_seconds(
++                    seconds: float,
++                    block_start: int = start,
++                    block_end: int = end,
++                    label: str = message,
++                ) -> None:
++                    position = max(block_start, min(block_end, seconds * AUDIO_SAMPLE_RATE))
++                    emit(min(0.999, position / total_frames), label)
++
++                block = transcribe_block(
++                    samples,
++                    transcript.language,
++                    left / AUDIO_SAMPLE_RATE,
++                    start / AUDIO_SAMPLE_RATE,
++                    end / AUDIO_SAMPLE_RATE,
++                    report_seconds,
++                )
++                block.save(checkpoint)
++                log.info(
++                    "Bloco %d/%d salvo (%.1f–%.1f s, %d palavras).",
++                    index,
++                    count,
++                    start / AUDIO_SAMPLE_RATE,
++                    end / AUDIO_SAMPLE_RATE,
++                    len(block.words),
++                )
++            else:
++                message = f"Bloco {index}/{count} reaproveitado"
++                log.info("%s: %d palavras.", message, len(block.words))
++            if not transcript.language and block.words:
++                transcript.language = block.language
++            _append_block(transcript, block)
++            emit(end / total_frames, message)
++    return transcript
++
++
++def load_checkpoint(path: Path) -> Transcript | None:
++    try:
++        return Transcript.load(path)
++    except FileNotFoundError:
++        return None
++    except (OSError, ValueError, TypeError, AttributeError) as exc:
++        log.warning("Bloco salvo inválido %s: %s", path.name, exc)
++        return None
++
++
++def _decode(model, audio, language, offset, start, end, on_progress) -> Transcript:
++    segments, info = model.transcribe(
++        audio,
++        language=language or None,
+         word_timestamps=True,
+         vad_filter=True,
+         # Trims long silences before decoding, which both speeds things up and
+@@ -134,54 +313,77 @@
+         vad_parameters={"min_silence_duration_ms": 500},
+     )
+ 
+-    total = duration_s or getattr(info, "duration", 0.0) or 0.0
+-    transcript = Transcript(
+-        language=getattr(info, "language", "") or settings.language,
+-        model=settings.model,
+-        source="whisper",
++    transcript = Transcript(language=getattr(info, "language", "") or language)
++    for segment in segments:
++        first_word = len(transcript.words)
++        words = getattr(segment, "words", None) or []
++        for word in words:
++            text = (word.word or "").strip()
++            word_start, word_end = offset + float(word.start), offset + float(word.end)
++            if text and start <= (word_start + word_end) / 2 < end:
++                transcript.words.append(Word(text, max(start, word_start), min(end, word_end)))
++
++        selected = transcript.words[first_word:]
++        if selected:
++            transcript.segments.append(
++                Segment(
++                    " ".join(w.text for w in selected),
++                    selected[0].start,
++                    selected[-1].end,
++                    first_word,
++                    len(transcript.words) - 1,
++                )
++            )
++        elif not words and start <= offset + (segment.start + segment.end) / 2 < end:
++            transcript.segments.append(
++                Segment(
++                    (segment.text or "").strip(),
++                    max(start, offset + segment.start),
++                    min(end, offset + segment.end),
++                    first_word,
++                    first_word,
++                )
++            )
++        on_progress(offset + float(segment.end))
++    return transcript
++
++
++def _append_block(transcript: Transcript, block: Transcript) -> None:
++    offset = len(transcript.words)
++    transcript.words.extend(block.words)
++    transcript.segments.extend(
++        replace(
++            segment, first_word=segment.first_word + offset, last_word=segment.last_word + offset
++        )
++        for segment in block.segments
+     )
+ 
+-    for segment in segments_iter:
+-        if cancelled is not None and cancelled():
+-            raise TranscriptionError("Transcription cancelled.")
+-
+-        first_word = len(transcript.words)
+-        for word in getattr(segment, "words", None) or []:
+-            text = (word.word or "").strip()
+-            if not text:
+-                continue
+-            transcript.words.append(Word(text=text, start=float(word.start), end=float(word.end)))
+-
+-        # A segment with no word timings still carries text worth keeping for
+-        # display, but it can't contribute to word-indexed clip boundaries.
+-        last_word = max(first_word, len(transcript.words) - 1)
+-        transcript.segments.append(
+-            Segment(
+-                text=(segment.text or "").strip(),
+-                start=float(segment.start),
+-                end=float(segment.end),
+-                first_word=first_word,
+-                last_word=last_word,
+-            )
+-        )
+-
+-        if on_progress and total:
+-            on_progress(min(1.0, float(segment.end) / total))
+-
+-    if not transcript.words:
+-        raise TranscriptionError(
+-            "No speech was detected in this audio. If the file really does contain "
+-            "speech, try a larger Whisper model or check that the correct audio track "
+-            "was extracted."
+-        )
+-
+-    if on_progress:
+-        on_progress(1.0)
+-
+-    log.info(
+-        "Transcribed %d words in %d segments.", len(transcript.words), len(transcript.segments)
++
++def _worker() -> None:
++    from ..cuda import ensure_cuda_libraries
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("audio", type=Path)
++    parser.add_argument("output", type=Path)
++    parser.add_argument("--settings", required=True)
++    parser.add_argument("--duration", type=float)
++    parser.add_argument("--checkpoints", type=Path)
++    args = parser.parse_args()
++    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
++    ensure_cuda_libraries()
++
++    def emit(position: float, message: str) -> None:
++        print(json.dumps({"position": position, "message": message}), flush=True)
++
++    result = _transcribe_audio(
++        args.audio,
++        WhisperSettings.model_validate_json(args.settings),
++        duration_s=args.duration,
++        checkpoint_dir=args.checkpoints or args.output.parent,
++        emit=emit,
+     )
+-    return transcript
++    result.save(args.output)
++    emit(1, f"Transcrição concluída ({len(result.words)} palavras)")
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -225,7 +427,8 @@
+         )
+         return transcript
+ 
+-    device = report().gpu.device
++    # Keep the optional second model on CPU, including when Whisper used CUDA.
++    device = "cpu"
+     try:
+         pipeline = pipeline_cls(use_auth_token=hf_token, device=device)
+         diarization = pipeline(str(audio), min_speakers=min_speakers, max_speakers=max_speakers)
+@@ -304,3 +507,7 @@
+ 
+     for segment in transcript.segments:
+         segment.speaker = transcript.dominant_speaker(segment.first_word, segment.last_word)
++
++
++if __name__ == "__main__":
++    _worker()
+diff --git a/backend/autoclip/pipeline/transcript.py b/backend/autoclip/pipeline/transcript.py
+--- a/backend/autoclip/pipeline/transcript.py
++++ b/backend/autoclip/pipeline/transcript.py
+@@ -206,7 +206,9 @@
+ 
+     def save(self, path: Path) -> Path:
+         path.parent.mkdir(parents=True, exist_ok=True)
+-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False), encoding="utf-8")
++        partial = path.with_suffix(".json.part")
++        partial.write_text(json.dumps(self.to_dict(), ensure_ascii=False), encoding="utf-8")
++        partial.replace(path)
+         return path
+ 
+     @classmethod
+diff --git a/backend/autoclip/providers/ollama_provider.py b/backend/autoclip/providers/ollama_provider.py
+--- a/backend/autoclip/providers/ollama_provider.py
++++ b/backend/autoclip/providers/ollama_provider.py
+@@ -45,6 +45,28 @@
+     def url(self) -> str:
+         return (self.base_url or DEFAULT_BASE_URL).rstrip("/")
+ 
++    def unload(self) -> bool:
++        """Release this model at a pipeline stage boundary."""
++        if not self.model:
++            return True
++        try:
++            with httpx.Client(timeout=5.0) as client:
++                running = client.get(f"{self.url}/api/ps")
++                running.raise_for_status()
++                if self.model not in {m.get("name") for m in running.json().get("models", [])}:
++                    return True
++                response = client.post(
++                    f"{self.url}/api/generate",
++                    json={"model": self.model, "keep_alive": 0},
++                )
++                response.raise_for_status()
++                return True
++        except httpx.ConnectError:
++            return True
++        except httpx.HTTPError as exc:
++            log.warning("Ollama não confirmou a liberação de %s: %s", self.model, exc)
++            return False
++
+     async def _complete(self, system: str, user: str, config: DetectionConfig) -> str:
+         if not self.model:
+             raise ProviderError(
+@@ -61,6 +83,7 @@
+             # Ollama's JSON mode constrains decoding to valid JSON, which is the
+             # single biggest reliability win for small local models.
+             "format": "json",
++            "keep_alive": "1m",
+             "options": {"temperature": config.temperature},
+         }
+ 
+diff --git a/backend/autoclip/system.py b/backend/autoclip/system.py
+--- a/backend/autoclip/system.py
++++ b/backend/autoclip/system.py
+@@ -221,37 +221,42 @@
+ 
+ 
+ def _probe_nvenc(exe: str) -> tuple[bool, str]:
+-    """Try a one-frame NVENC encode to null. Returns (works, error summary).
++    """Try an actual portrait encode to null. Returns (works, error summary).
+ 
+     The cheapest honest test. Checking the encoder list only tells us the build
+     has the code, not that the driver supports the API version it was built
+     against — that mismatch is common and only surfaces mid-render.
+     """
+-    output = _run(
+-        [
+-            exe,
+-            "-hide_banner",
+-            "-nostdin",
+-            "-f",
+-            "lavfi",
+-            "-i",
+-            "color=c=black:s=256x256:d=0.1",
+-            "-c:v",
+-            "h264_nvenc",
+-            "-frames:v",
+-            "1",
+-            "-f",
+-            "null",
+-            "-",
+-        ]
+-    )
+-    lowered = output.lower()
+-    if "error" in lowered or "cannot load" in lowered or "not support" in lowered:
+-        for line in output.splitlines():
+-            if "nvenc" in line.lower() and ("driver" in line.lower() or "requir" in line.lower()):
+-                return False, line.strip()
+-        return False, "NVENC initialisation failed."
+-    return True, ""
++    try:
++        probe = subprocess.run(
++            [
++                exe,
++                "-hide_banner",
++                "-nostdin",
++                "-f",
++                "lavfi",
++                "-i",
++                "color=c=black:s=720x1280:r=30",
++                "-c:v",
++                "h264_nvenc",
++                "-frames:v",
++                "4",
++                "-f",
++                "null",
++                "-",
++            ],
++            capture_output=True,
++            encoding="utf-8",
++            errors="replace",
++            timeout=_TIMEOUT_S,
++            check=False,
++        )
++    except (OSError, subprocess.SubprocessError) as exc:
++        return False, f"Não foi possível testar NVENC: {exc}"
++    if probe.returncode == 0:
++        return True, ""
++    details = [line.strip() for line in probe.stderr.splitlines() if "[h264_nvenc @" in line]
++    return False, details[0] if details else f"O teste de NVENC retornou código {probe.returncode}."
+ 
+ 
+ def probe_gpu() -> GPUInfo:
+@@ -283,10 +288,8 @@
+                 with contextlib.suppress(ValueError):
+                     info.compute_capability = float(fields[3])
+ 
+-    # nvidia-smi seeing a card doesn't mean CTranslate2 can use it — the CUDA
+-    # runtime and cuDNN also have to be loadable. This is the check that counts.
+-    # Registering the pip-installed library directories first is what makes them
+-    # findable; without it the probe passes and inference later fails.
++    # Device discovery does not load every inference library. The Whisper
++    # worker tries inference and falls back to CPU if a runtime DLL is missing.
+     from .cuda import ensure_cuda_libraries
+ 
+     ensure_cuda_libraries()
+diff --git a/frontend/src/api.ts b/frontend/src/api.ts
+--- a/frontend/src/api.ts
++++ b/frontend/src/api.ts
+@@ -22,6 +22,7 @@
+ }
+ 
+ export type JobStatus = 'queued' | 'running' | 'failed' | 'done' | 'cancelled'
++export type Resolution = '1080p' | '720p'
+ 
+ export interface Job {
+   id: string
+@@ -29,6 +30,8 @@
+   status: JobStatus
+   current_stage: string
+   progress: number
++  stage_progress: number
++  progress_message: string
+   error: string | null
+   provider: string
+   created_at: string
+@@ -132,7 +135,7 @@
+ export interface Settings {
+   active_provider: string
+   providers: Record<string, { model: string; base_url: string | null }>
+-  whisper: { model: string; compute_type: string; language: string; diarization: boolean }
++  whisper: { model: string; device: 'cpu' | 'auto'; compute_type: string; language: string; diarization: boolean }
+   clips: { min_duration_s: number; max_duration_s: number; max_clips: number }
+   ingest: {
+     ytdlp_format: string
+@@ -141,6 +144,7 @@
+   }
+   export: {
+     ratio: string
++    resolution: Resolution
+     caption_style: string
+     loudness_lufs: number
+     prefer_hardware_encoder: boolean
+@@ -158,8 +162,11 @@
+   ffmpeg_version: string | null
+   has_libass: boolean
+   nvenc_works: boolean
++  nvenc_error: string
+   accel: string
+   gpu_name: string | null
++  driver_version: string | null
++  whisper_device: string
+   compute_type: string
+   diarization_available: boolean
+ }
+@@ -174,6 +181,7 @@
+   max_clips?: number
+   caption_style?: string
+   ratio?: string
++  resolution?: Resolution
+ }
+ 
+ /** An API error carrying the server's message and its actionable hint. */
+@@ -252,6 +260,7 @@
+ 
+   cancelJob: (id: string) => request<Job>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+   retryJob: (id: string) => request<Job>(`/api/jobs/${id}/retry`, { method: 'POST' }),
++  jobLogUrl: (id: string) => `/api/jobs/${id}/log`,
+ 
+   listClips: (jobId: string) => request<Clip[]>(`/api/jobs/${jobId}/clips`),
+   getClip: (clipId: string) => request<Clip>(`/api/clips/${clipId}`),
+diff --git a/frontend/src/pages/Ingest.tsx b/frontend/src/pages/Ingest.tsx
+--- a/frontend/src/pages/Ingest.tsx
++++ b/frontend/src/pages/Ingest.tsx
+@@ -249,6 +249,16 @@
+               max={50}
+               onChange={(v) => set('max_clips', v)}
+             />
++            <Selector
++              label="Resolução do corte"
++              value={overrides.resolution ?? ''}
++              onChange={(value) => set('resolution', value === '720p' || value === '1080p' ? value : undefined)}
++              options={[
++                { value: '', label: 'Usar configuração geral' },
++                { value: '720p', label: 'Rápido · 720p' },
++                { value: '1080p', label: 'Padrão · 1080p' },
++              ]}
++            />
+             <div className="grid grid-cols-2 gap-4">
+               <NumberField
+                 label="Min length (s)"
+diff --git a/frontend/src/pages/JobProgress.tsx b/frontend/src/pages/JobProgress.tsx
+--- a/frontend/src/pages/JobProgress.tsx
++++ b/frontend/src/pages/JobProgress.tsx
+@@ -7,18 +7,20 @@
+ 
+ /** Stage order and labels, mirroring autoclip.pipeline.Stage. */
+ const STAGES = [
+-  { key: 'prepare', label: 'Prepare', note: 'Extracting audio and thumbnails' },
+-  { key: 'transcribe', label: 'Transcribe', note: 'Word-level timing' },
+-  { key: 'highlights', label: 'Highlights', note: 'Choosing the moments worth cutting' },
+-  { key: 'reframe', label: 'Reframe', note: 'Tracking the speaker into vertical' },
+-  { key: 'captions', label: 'Captions', note: 'Building subtitle timing' },
+-  { key: 'export', label: 'Export', note: 'Rendering clips' },
++  { key: 'prepare', label: 'Preparação', note: 'Extração de áudio e análise de pausas' },
++  { key: 'transcribe', label: 'Transcrição', note: 'Reconhecimento de fala por blocos' },
++  { key: 'highlights', label: 'Seleção', note: 'Análise dos momentos do vídeo' },
++  { key: 'reframe', label: 'Enquadramento', note: 'Ajuste do quadro aos cortes' },
++  { key: 'captions', label: 'Legendas', note: 'Preparação das legendas' },
++  { key: 'export', label: 'Renderização', note: 'Geração dos arquivos MP4' },
+ ] as const
++
++const STATUS = { queued: 'Na fila', running: 'Processando', failed: 'Falhou', done: 'Concluído', cancelled: 'Cancelado' }
+ 
+ export function JobProgress() {
+   const { jobId } = useParams()
+   const navigate = useNavigate()
+-  const { job, progress } = useJobStream(jobId)
++  const { job, connected, setJob } = useJobStream(jobId)
+   const [cancelling, setCancelling] = useState(false)
+   const [actionError, setActionError] = useState<Error | null>(null)
+ 
+@@ -31,17 +33,20 @@
+   }, [job?.status, job?.id, navigate])
+ 
+   if (!job) {
+-    return <p className="pt-24 text-sm text-ink-500">Loading…</p>
++    return <p className="pt-24 text-sm text-ink-500">Carregando tarefa…</p>
+   }
+ 
+   const activeIndex = STAGES.findIndex((s) => s.key === job.current_stage)
+-  const percent = Math.round((progress?.overall ?? job.progress) * 100)
++  const percent = Math.min(job.status === 'done' ? 100 : 99, Math.round(job.progress * 100))
+ 
+   const cancel = async () => {
+     setCancelling(true)
+     setActionError(null)
+     try {
+-      await api.cancelJob(job.id)
++      const response = await api.cancelJob(job.id)
++      if (response.status === 'cancelled') {
++        setJob((current) => current ? { ...current, ...response, source: current.source } : response)
++      }
+     } catch (err) {
+       setActionError(err as Error)
+     } finally {
+@@ -63,9 +68,9 @@
+     <div className="pt-14">
+       <div className="rise flex flex-wrap items-baseline justify-between gap-6 border-b border-ink-800 pb-6">
+         <div className="min-w-0">
+-          <p className="eyebrow">{job.status}</p>
++          <p className="eyebrow">{STATUS[job.status]}</p>
+           <h1 className="mt-2 max-w-3xl truncate font-display text-[clamp(1.75rem,4vw,3rem)] leading-tight text-ink-100">
+-            {job.source?.title || 'Untitled'}
++            {job.source?.title || 'Vídeo sem título'}
+           </h1>
+           {job.source && (
+             <p className="numeric mt-2 text-xs text-ink-500">
+@@ -83,27 +88,34 @@
+           </span>
+           {(job.status === 'running' || job.status === 'queued') && (
+             <button onClick={cancel} disabled={cancelling} className="btn btn-ghost">
+-              {cancelling ? 'Cancelling…' : 'Cancel'}
++              {cancelling ? 'Cancelando…' : 'Cancelar'}
+             </button>
+           )}
+           {(job.status === 'failed' || job.status === 'cancelled') && (
+             <button onClick={retry} className="btn btn-primary">
+-              Retry
++              Tentar novamente
+             </button>
+           )}
+           {job.status === 'done' && (
+             <button onClick={() => navigate(`/jobs/${job.id}/clips`)} className="btn btn-primary">
+-              Review clips
++              Revisar cortes
+             </button>
+           )}
+         </div>
++      </div>
++
++      <div className="mt-4 flex flex-wrap items-center gap-4 text-xs text-ink-500">
++        <a className="underline" href={api.jobLogUrl(job.id)} target="_blank" rel="noreferrer">Ver log da tarefa</a>
++        {job.status === 'running' && (
++          <span>{connected ? `Última atualização: ${new Date(job.updated_at).toLocaleTimeString('pt-BR')}` : 'Reconectando ao processamento…'}</span>
++        )}
+       </div>
+ 
+       {job.error && (
+         <div className="mt-8 max-w-3xl">
+           <ErrorNote error={new Error(job.error)} />
+           <p className="mt-3 text-xs text-ink-500">
+-            Retrying resumes from the stage that failed — finished stages are not redone.
++            Uma nova tentativa reutiliza os arquivos e blocos já concluídos.
+           </p>
+         </div>
+       )}
+@@ -132,7 +144,7 @@
+                   : 'pending'
+ 
+           const fraction =
+-            state === 'done' ? 1 : state === 'active' ? (progress?.stageProgress ?? 0) : 0
++            state === 'done' ? 1 : state === 'active' || state === 'stopped' ? (job.stage_progress ?? 0) : 0
+ 
+           return (
+             <li
+@@ -170,10 +182,10 @@
+                   >
+                     {state === 'stopped'
+                       ? job.status === 'cancelled'
+-                        ? 'cancelled here'
+-                        : 'failed here'
++                        ? 'Cancelada nesta etapa'
++                        : 'Falhou nesta etapa'
+                       : state === 'active'
+-                        ? (progress?.message ?? stage.note)
++                        ? `${job.progress_message || stage.note} · ${Math.round(fraction * 100)}% da etapa`
+                         : stage.note}
+                   </span>
+                 </div>
+diff --git a/frontend/src/pages/Settings.tsx b/frontend/src/pages/Settings.tsx
+--- a/frontend/src/pages/Settings.tsx
++++ b/frontend/src/pages/Settings.tsx
+@@ -162,6 +162,14 @@
+             placeholder="auto"
+             onCommit={(value) => patch({ whisper: { ...settings.whisper, language: value } })}
+           />
++          <Select
++            label="Dispositivo do Whisper"
++            hint="No automático, o Whisper tenta CUDA e volta para CPU se a aceleração falhar."
++            value={settings.whisper.device}
++            onChange={(value) => patch({ whisper: { ...settings.whisper, device: value === 'auto' ? 'auto' : 'cpu' } })}
++            options={['cpu', 'auto']}
++            labels={{ cpu: 'CPU', auto: 'Automático' }}
++          />
+         </div>
+ 
+         <label className="mt-5 flex items-start gap-3 text-sm text-ink-200">
+@@ -229,6 +237,13 @@
+             onChange={(value) => patch({ export: { ...settings.export, ratio: value } })}
+             options={['9:16', '1:1', '16:9']}
+           />
++          <Select
++            label="Resolução padrão dos cortes"
++            value={settings.export.resolution}
++            onChange={(value) => patch({ export: { ...settings.export, resolution: value === '720p' ? '720p' : '1080p' } })}
++            options={['1080p', '720p']}
++            labels={{ '1080p': 'Padrão · 1080p', '720p': 'Rápido · 720p' }}
++          />
+           <NumberField
+             label="Loudness target (LUFS)"
+             value={settings.export.loudness_lufs}
+@@ -251,8 +266,7 @@
+             Use GPU encoding when available
+             {system && !system.nvenc_works && (
+               <span className="mt-1 block text-xs text-ink-500">
+-                Not usable on this machine — exports will use the CPU encoder. Same quality,
+-                slower.
++                {system.nvenc_error || 'NVENC indisponível'}. A renderização usa libx264.
+               </span>
+             )}
+           </span>
+@@ -277,7 +291,8 @@
+             <Row label="ffmpeg" value={system.ffmpeg_version ?? 'not found'} />
+             <Row label="Acceleration" value={system.accel.toUpperCase()} />
+             <Row label="Device" value={system.gpu_name ?? '—'} />
+-            <Row label="Whisper compute" value={system.compute_type} />
++            <Row label="Driver NVIDIA" value={system.driver_version ?? '—'} />
++            <Row label="Whisper configurado" value={`${system.whisper_device.toUpperCase()} · ${system.compute_type}`} />
+             <Row label="GPU encode" value={system.nvenc_works ? 'available' : 'unavailable'} />
+             <Row label="Captions" value={system.has_libass ? 'libass present' : 'libass missing'} />
+           </dl>
+diff --git a/frontend/src/useJobStream.ts b/frontend/src/useJobStream.ts
+--- a/frontend/src/useJobStream.ts
++++ b/frontend/src/useJobStream.ts
+@@ -1,13 +1,6 @@
+-import { useEffect, useRef, useState } from 'react'
++import { useEffect, useState } from 'react'
+ 
+ import { api, type Job } from './api'
+-
+-export interface StageProgress {
+-  stage: string
+-  stageProgress: number
+-  overall: number
+-  message: string
+-}
+ 
+ /**
+  * Subscribe to a job's Server-Sent Event stream.
+@@ -19,26 +12,14 @@
+  */
+ export function useJobStream(jobId: string | undefined) {
+   const [job, setJob] = useState<Job | null>(null)
+-  const [progress, setProgress] = useState<StageProgress | null>(null)
+   const [connected, setConnected] = useState(false)
+-  const sourceRef = useRef<EventSource | null>(null)
+ 
+   useEffect(() => {
+     if (!jobId) return
+ 
+-    let cancelled = false
+-
+-    // Fetch once up front so the page renders immediately rather than waiting
+-    // for the stream's first message.
+-    api
+-      .getJob(jobId)
+-      .then((initial) => {
+-        if (!cancelled) setJob(initial)
+-      })
+-      .catch(() => undefined)
+-
++    setJob(null)
++    setConnected(false)
+     const source = new EventSource(`/api/jobs/${jobId}/events`)
+-    sourceRef.current = source
+ 
+     const close = () => {
+       source.close()
+@@ -55,15 +36,13 @@
+ 
+     source.addEventListener('progress', (event) => {
+       const data = JSON.parse((event as MessageEvent).data)
+-      setProgress({
+-        stage: data.stage,
+-        stageProgress: data.stage_progress,
+-        overall: data.overall,
+-        message: data.message,
+-      })
+       setJob((current) =>
+         current
+-          ? { ...current, status: 'running', current_stage: data.stage, progress: data.overall }
++          ? {
++              ...current, status: 'running', current_stage: data.stage, progress: data.overall,
++              stage_progress: data.stage_progress, progress_message: data.message,
++              updated_at: data.updated_at ?? current.updated_at,
++            }
+           : current,
+       )
+     })
+@@ -82,14 +61,21 @@
+     source.addEventListener('failed', terminal('failed'))
+     source.addEventListener('cancelled', terminal('cancelled'))
+ 
+-    source.onerror = () => setConnected(false)
++    let disposed = false
++    source.onerror = () => {
++      setConnected(false)
++      void api.getJob(jobId).then((latest) => {
++        if (disposed || source.readyState === EventSource.OPEN) return
++        setJob(latest)
++        if (['done', 'failed', 'cancelled'].includes(latest.status)) close()
++      }).catch(() => undefined)
++    }
+ 
+     return () => {
+-      cancelled = true
++      disposed = true
+       source.close()
+-      sourceRef.current = null
+     }
+   }, [jobId])
+ 
+-  return { job, progress, connected, setJob }
++  return { job, connected, setJob }
+ }
+diff --git a/tests/test_studio_performance.py b/tests/test_studio_performance.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_studio_performance.py
+@@ -0,0 +1,231 @@
++"""Regressions for stalled processes, checkpointing, and fast exports."""
++
++from __future__ import annotations
++
++import json
++import shutil
++import sys
++import time
++import wave
++from types import SimpleNamespace
++
++import pytest
++from autoclip import config, db
++from autoclip.db import store
++from autoclip.db.models import Job, Source
++from autoclip.db.schema import MIGRATIONS
++from autoclip.pipeline import Cancelled, Stage, export, ffmpeg, prepare, process, transcribe
++from autoclip.pipeline.reframe.croppath import centre_crop
++from autoclip.pipeline.runner import PipelineRunner
++from autoclip.pipeline.transcript import Segment, Transcript, Word
++
++
++def test_process_drains_stderr_and_stops_when_timestamp_repeats():
++    updates = []
++    child = (
++        "import sys, time; "
++        "print('diagnostic!' * 20000, file=sys.stderr, flush=True); "
++        "print('out_time_us=1000000', flush=True); "
++        "time.sleep(0.15); print('out_time_us=1000000', flush=True); time.sleep(60)"
++    )
++    result = process.run(
++        [sys.executable, "-c", child],
++        label="fixture",
++        parse=ffmpeg._parse_progress,
++        idle_timeout_s=0.8,
++        on_progress=updates.append,
++        kill_tree=True,
++    )
++    assert result.stalled
++    assert result.code != 0
++    assert result.progress.position == 1
++    assert updates == [process.Update(1)]
++    assert "diagnostic!" in result.stderr
++
++
++def test_cancel_interrupts_a_silent_process():
++    start = time.monotonic()
++    with pytest.raises(Cancelled):
++        process.run(
++            [sys.executable, "-c", "import time; time.sleep(60)"],
++            label="fixture",
++            parse=ffmpeg._parse_progress,
++            idle_timeout_s=30,
++            cancelled=lambda: time.monotonic() - start > 0.2,
++            kill_tree=True,
++        )
++    assert time.monotonic() - start < 5
++
++
++def test_old_jobs_survive_migration_and_store_stage_progress(autoclip_home):
++    conn = db.connect()
++    with conn:
++        MIGRATIONS[0](conn)
++        conn.execute("PRAGMA user_version = 1")
++        conn.execute(
++            "INSERT INTO sources(id, type, path, created_at) VALUES ('s','upload','old', '')"
++        )
++        conn.execute(
++            "INSERT INTO jobs (id,source_id,status,progress,settings_json,created_at,updated_at) "
++            "VALUES ('j','s','failed',0.05,?, '', '')",
++            (json.dumps({"clips": {"max_clips": 2}}),),
++        )
++    conn.close()
++    db.init()
++    original = store.get_job("j")
++    assert original and original.progress == 0.05 and original.stage_progress == 0
++    assert config.for_job(original.settings).clips.max_clips == 2
++    assert store.retry_job("j")
++    assert not store.retry_job("j")
++    assert store.claim_job("j")
++    store.update_job("j", stage_progress=0.5, progress_message="Bloco 1 de 2")
++    updated = store.get_job("j")
++    assert updated and updated.stage_progress == 0.5 and updated.progress_message == "Bloco 1 de 2"
++
++
++def test_prepare_reuses_intact_audio_and_skips_unused_thumbnails(monkeypatch, tmp_path):
++    db.init()
++    video = tmp_path / "Caminho com acento ç.mp4"
++    video.touch()
++    source = store.create_source(Source("src", "upload", str(video), duration_s=2.0))
++    job = store.create_job(Job("job", source.id, settings={"export": {"resolution": "720p"}}))
++    events = []
++    runner = PipelineRunner(job, source, on_progress=events.append)
++    runner.workspace.audio.write_bytes(b"RIFF0000WAVE")
++    assert prepare.audio_duration(runner.workspace.audio) is None
++
++    def extract(_source, output, *, on_progress, **_options):
++        _write_wav(output, 2)
++        on_progress(0.5)
++        on_progress(1.0)
++
++    monkeypatch.setattr(
++        ffmpeg, "probe", lambda _: SimpleNamespace(has_audio=True, audio_duration_s=2)
++    )
++    monkeypatch.setattr(prepare, "extract_audio", extract)
++    monkeypatch.setattr(prepare, "detect_silences", lambda *a, **kw: [prepare.Silence(0, 1)])
++    audio, silences = runner._stage_prepare()
++    assert prepare.audio_duration(audio) == 2
++    assert silences == [prepare.Silence(0, 1)]
++    assert not (runner.workspace.root / "thumbnails").exists()
++    assert all(evt.stage == Stage.PREPARE for evt in events)
++    assert events[-1].overall == 0.05
++    assert any("Extraindo" in evt.message for evt in events)
++    assert runner.settings.export.resolution == "720p"
++
++    def unexpected(*_args, **_kwargs):
++        pytest.fail("already completed work ran again")
++
++    monkeypatch.setattr(prepare, "extract_audio", unexpected)
++    monkeypatch.setattr(prepare, "detect_silences", unexpected)
++    restarted = PipelineRunner(job, source)
++    assert restarted._stage_prepare() == (audio, silences)
++
++
++def _write_wav(path, duration):
++    with wave.open(str(path), "wb") as wav:
++        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
++        wav.writeframes(bytes(duration * 16000 * 2))
++
++
++def test_whisper_resumes_from_completed_blocks_including_silence(tmp_path, monkeypatch):
++    monkeypatch.setattr(transcribe, "BLOCK_SECONDS", 4)
++    monkeypatch.setattr(transcribe, "OVERLAP_SECONDS", 1)
++    audio = tmp_path / "prepared.wav"
++    checkpoints = tmp_path / "blocks"
++    _write_wav(audio, 10)
++    settings = config.WhisperSettings(device="cpu", language="pt")
++
++    def transcribe_block(samples, language, offset, start, end, report):
++        assert language == "pt" and offset <= start < end
++        assert len(samples) <= 6 * 16000
++        if start == 4:
++            return Transcript(language="pt")
++        report(start + 0.4)
++        word = Word(f"{start:g}", start + 0.1, start + 0.4)
++        return Transcript(
++            language="pt", words=[word], segments=[Segment(word.text, word.start, word.end)]
++        )
++
++    def interrupted(samples, language, offset, start, end, report):
++        if start == 8:
++            raise Cancelled("interrupted")
++        return transcribe_block(samples, language, offset, start, end, report)
++
++    with pytest.raises(Cancelled):
++        transcribe._transcribe_wav(
++            audio, settings, "cpu", checkpoints, lambda *_: None, interrupted
++        )
++    assert len(list(checkpoints.rglob("*.json"))) == 2
++    starts = []
++
++    def resumed(samples, language, offset, start, end, report):
++        starts.append(start)
++        return transcribe_block(samples, language, offset, start, end, report)
++
++    result = transcribe._transcribe_wav(
++        audio, settings, "cpu", checkpoints, lambda *_: None, resumed
++    )
++    assert starts == [8]
++    assert [word.start for word in result.words] == [0.1, 8.1]
++    assert [segment.first_word for segment in result.segments] == [0, 1]
++
++
++@pytest.mark.slow
++@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg is not installed")
++def test_fast_export_retries_nvenc_with_real_libx264(tmp_path, monkeypatch):
++    source = tmp_path / "origem.mp4"
++    ffmpeg.run(
++        [
++            "-f",
++            "lavfi",
++            "-i",
++            "color=size=320x180:rate=24",
++            "-f",
++            "lavfi",
++            "-i",
++            "sine=frequency=900:sample_rate=48000",
++            "-t",
++            "1.2",
++            "-c:v",
++            "libx264",
++            "-c:a",
++            "aac",
++            str(source),
++        ]
++    )
++    destination = tmp_path / "rápido.mp4"
++    settings = config.ExportSettings(resolution="720p", prefer_hardware_encoder=True)
++    monkeypatch.setattr(
++        export, "report", lambda: SimpleNamespace(ffmpeg=SimpleNamespace(nvenc_works=True))
++    )
++    run = ffmpeg.run
++    encoders = []
++
++    def fail_nvenc(args, **kwargs):
++        encoder = args[args.index("-c:v") + 1]
++        encoders.append(encoder)
++        if encoder == "h264_nvenc":
++            raise ffmpeg.FFmpegError("Failed", command=args, stderr="Cannot load NVENC")
++        return run(args, **kwargs)
++
++    monkeypatch.setattr(ffmpeg, "run", fail_nvenc)
++    request = export.ExportRequest(
++        source,
++        destination,
++        0,
++        1,
++        centre_crop(320, 180, 1),
++        [Word("Teste", 0.1, 0.8)],
++        export.captions_module.get_style("clean_lower"),
++    )
++    export.export_clip(request, work_dir=tmp_path / "render", settings=settings)
++    output = ffmpeg.probe(destination)
++    assert encoders == ["h264_nvenc", "libx264"]
++    assert (output.width, output.height, output.video_codec, output.audio_codec) == (
++        720,
++        1280,
++        "h264",
++        "aac",
++    )
++    assert not list(tmp_path.glob("*.part.mp4"))
