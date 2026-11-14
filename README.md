@@ -1,5 +1,11 @@
 # AI Shorts Studio · Clipador IA
 
+O painel abre em tema claro e usa português brasileiro. Use **Tema escuro** para alternar. A preferência é salva no navegador. O Clipador continua usando o AutoClip para analisar, editar e exportar os cortes.
+
+Em **Instagram**, prepare um Reel a partir de um MP4 vertical exportado. A integração oferece até duas contas profissionais, aprovação antes do agendamento, fila por conta e histórico. A publicação começa pausada e depende das credenciais e permissões da Meta. [Configurar o Instagram no Windows](docs/instagram-meta.md)
+
+**Histórias IA** tem uma página própria para o futuro fluxo de produção em cartoon 2D.
+
 ## Fase 1 do AI Shorts Studio 2.0
 
 Na gravação investigada, de 2 h 01 min, o SQLite registrou a tarefa como interrompida na transcrição a 5%. O WAV completo já existia. A implementação anterior atingia 5% ao terminar a extração, ainda com a etapa **Prepare** no painel, e decodificava o vídeo para gerar miniaturas sem atualizar a barra. O player usa o vídeo original. A nova preparação extrai o áudio, analisa as pausas e mede o avanço do FFmpeg pela posição na mídia. [Documentação do FFmpeg](https://ffmpeg.org/ffmpeg.html)
@@ -35,7 +41,7 @@ O teste no Windows 11 x64 usa o AutoClip `0.1.0.dev0`, commit `5d0eac36fa615b79d
 ### Lacunas e riscos para o Clipador IA
 
 - A nota e a justificativa atuais são estimativas do LLM com base na fala. A seleção para gameplay precisa combinar sinais de áudio e visuais, detectar reações, explicitar a contribuição de cada sinal e evitar trechos semelhantes mesmo quando aparecem em intervalos distintos. A detecção visual existente é usada no reenquadramento. [Seleção](https://github.com/Gutsken/Autoclip/blob/5d0eac36fa615b79dd2104083bf273a96f8d68bb/backend/autoclip/pipeline/highlights.py) · [Pipeline](https://github.com/Gutsken/Autoclip/blob/5d0eac36fa615b79dd2104083bf273a96f8d68bb/backend/autoclip/pipeline/runner.py)
-- Gameplay ainda precisa de critérios de enquadramento que preservem o HUD, avaliação com clipes reais e transições discretas. A localização completa da interface, a confirmação de autorização para material de terceiros e a exportação final condicionada à aprovação pertencem às próximas fases.
+- Gameplay ainda precisa de critérios de enquadramento que preservem o HUD, avaliação com clipes reais e transições discretas. A publicação de Reels exige confirmação de autorização para o vídeo e o áudio e aprovação da prévia. Títulos, justificativas e logs do Clipador podem aparecer no idioma do modelo ou da ferramenta que os gerou.
 - O WAV intermediário de três horas ocupa cerca de 346 MB em disco. Cada bloco de 120 s, incluindo a sobreposição, carrega menos de 8 MB de amostras em `float32`, além da memória usada pelo modelo e suas características. A diarização opcional continua usando o WAV inteiro.
 - O AutoClip está em desenvolvimento e a automação do projeto de origem cobre renderização em Windows com Python 3.12. O teste de integração original usa respostas roteirizadas no lugar do LLM e requer vídeo com rosto detectável. A qualidade da seleção e do reenquadramento em gameplay depende de avaliação com gravações representativas. [CI do projeto de origem](https://github.com/artbyjazi/autoclip/blob/5d0eac36fa615b79dd2104083bf273a96f8d68bb/.github/workflows/ci.yml) · [Teste de integração original](https://github.com/Gutsken/Autoclip/blob/5d0eac36fa615b79dd2104083bf273a96f8d68bb/tests/test_pipeline_e2e.py)
 
@@ -54,7 +60,7 @@ Abra o PowerShell na pasta do projeto com Git, Node.js 20 ou superior e npm disp
 .\scripts\instalar-fase1.ps1
 ```
 
-Inicie o Ollama e o painel no mesmo terminal. Mantenha o terminal aberto durante o uso e pressione `Ctrl+C` para encerrar. O painel roda apenas no endereço local porque o AutoClip não tem autenticação. A configuração, o banco SQLite e os vídeos do painel ficam em `$env:LOCALAPPDATA\AI Shorts Studio\autoclip` por padrão, fora da pasta sincronizada pelo OneDrive. Para alterar essa pasta, defina `$env:AI_SHORTS_STUDIO_DATA` antes de iniciar. [Abrir AutoClip](http://127.0.0.1:8000) · [Política de segurança do AutoClip](https://github.com/Gutsken/Autoclip/blob/5d0eac36fa615b79dd2104083bf273a96f8d68bb/SECURITY.md#running-it-safely)
+Inicie o Ollama e o painel no mesmo terminal. Mantenha o terminal aberto durante o uso e pressione `Ctrl+C` para encerrar. O painel roda apenas no endereço local porque o AutoClip não tem autenticação. A configuração, o banco SQLite e os vídeos do painel ficam em `$env:LOCALAPPDATA\AI Shorts Studio\autoclip` por padrão, fora da pasta sincronizada pelo OneDrive. Para alterar essa pasta, defina `$env:AI_SHORTS_STUDIO_DATA` antes de iniciar. [Abrir AI Shorts Studio](http://localhost:8000) · [Política de segurança do AutoClip](https://github.com/Gutsken/Autoclip/blob/5d0eac36fa615b79dd2104083bf273a96f8d68bb/SECURITY.md#running-it-safely)
 
 ```powershell
 .\scripts\iniciar-fase1.ps1

@@ -70,7 +70,7 @@ if (-not (Test-Path -LiteralPath $autoclipRoot)) {
     Move-Item -LiteralPath (Join-Path $downloads "Autoclip-$commit") -Destination $autoclipRoot
 }
 
-foreach ($patchName in @('autoclip-windows-mediapipe.patch', 'autoclip-performance.patch')) {
+foreach ($patchName in @('autoclip-windows-mediapipe.patch', 'autoclip-performance.patch', 'autoclip-studio.patch')) {
     $patch = Join-Path $PSScriptRoot $patchName
     $previousErrorPreference = $ErrorActionPreference
     try {
