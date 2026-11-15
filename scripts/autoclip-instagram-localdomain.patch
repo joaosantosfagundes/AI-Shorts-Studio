@@ -1,0 +1,226 @@
+diff --git a/backend/autoclip/cli.py b/backend/autoclip/cli.py
+--- a/backend/autoclip/cli.py
++++ b/backend/autoclip/cli.py
+@@ -640,6 +640,9 @@
+         None, "--ssl-certfile", exists=True, dir_okay=False,
+         help="PEM com certificado e chave privada do servidor HTTPS local.",
+     ),
++    browser_host: str | None = typer.Option(
++        None, "--browser-host", help="Nome local usado pelo navegador, sem alterar o bind."
++    ),
+ ) -> None:
+     """Start the AutoClip web app."""
+     import threading
+@@ -649,6 +652,10 @@
+ 
+     from . import db
+     from .app import static_dir
++    from .instagram.meta import LOOPBACK_HOSTS
++
++    if browser_host is not None and browser_host not in LOOPBACK_HOSTS:
++        raise typer.BadParameter("Use um nome de host local.", param_hint="--browser-host")
+ 
+     db.init()
+ 
+@@ -660,7 +667,10 @@
+         )
+ 
+     scheme = "https" if ssl_certfile else "http"
+-    url = f"{scheme}://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
++    display_host = browser_host or ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host)
++    if ":" in display_host:
++        display_host = f"[{display_host}]"
++    url = f"{scheme}://{display_host}:{port}"
+     console.print(f"[green]AutoClip[/green] starting on [cyan]{url}[/cyan]")
+ 
+     if host == "0.0.0.0":  # noqa: S104
+diff --git a/backend/autoclip/instagram/api.py b/backend/autoclip/instagram/api.py
+--- a/backend/autoclip/instagram/api.py
++++ b/backend/autoclip/instagram/api.py
+@@ -22,6 +22,7 @@
+ from .media import prepare_draft, reel_exports, verify_media
+ from .meta import (
+     CALLBACK,
++    LOOPBACK_ADDRESSES,
+     LOOPBACK_HOSTS,
+     Authorization,
+     InstagramError,
+@@ -61,10 +62,14 @@
+     host = request.headers.get("host", "")
+     try:
+         parsed = urlsplit("//" + host)
+-        valid = parsed.netloc == host and parsed.hostname in LOOPBACK_HOSTS and not parsed.username
++        valid = (
++            parsed.netloc == host
++            and parsed.hostname in LOOPBACK_HOSTS
++            and parsed.username is None
++        )
+     except ValueError:
+         valid = False
+-    if not valid or not request.client or request.client.host not in LOOPBACK_HOSTS:
++    if not valid or not request.client or request.client.host not in LOOPBACK_ADDRESSES:
+         raise HTTPException(403, "Abra o AI Shorts Studio pelo endereço local.")
+     if request.method not in {"GET", "HEAD"} and (
+         request.headers.get("x-studio-local") != "1"
+diff --git a/backend/autoclip/instagram/meta.py b/backend/autoclip/instagram/meta.py
+--- a/backend/autoclip/instagram/meta.py
++++ b/backend/autoclip/instagram/meta.py
+@@ -14,8 +14,10 @@
+ import httpx
+ 
+ CALLBACK = "/api/instagram/oauth/callback"
+-DEFAULT_REDIRECT = "https://localhost:8000" + CALLBACK
+-LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
++STUDIO_HOST = "localhost.localdomain"
++DEFAULT_REDIRECT = f"https://{STUDIO_HOST}:8000{CALLBACK}"
++LOOPBACK_ADDRESSES = {"127.0.0.1", "::1"}
++LOOPBACK_HOSTS = LOOPBACK_ADDRESSES | {"localhost", STUDIO_HOST}
+ PUBLISH_SCOPES = {"instagram_basic", "instagram_content_publish"}
+ RENEW_SCOPE = "business_management"
+ 
+diff --git a/backend/autoclip/instagram/tls.py b/backend/autoclip/instagram/tls.py
+--- a/backend/autoclip/instagram/tls.py
++++ b/backend/autoclip/instagram/tls.py
+@@ -15,8 +15,11 @@
+ from cryptography.hazmat.primitives.asymmetric import rsa
+ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+ 
+-SERVER_CERT = "localhost-server.pem"
+-PUBLIC_CERT = "localhost.cer"
++from .meta import STUDIO_HOST
++
++SERVER_CERT = f"{STUDIO_HOST}-server.pem"
++PUBLIC_CERT = f"{STUDIO_HOST}.cer"
++DNS_NAMES = [STUDIO_HOST, "localhost"]
+ 
+ 
+ def _replace_file(path: Path, content: bytes) -> None:
+@@ -39,11 +42,17 @@
+         certificate = x509.load_pem_x509_certificate(bundle.read_bytes())
+         if not certificate.not_valid_before_utc <= now < certificate.not_valid_after_utc:
+             raise ValueError("O certificado venceu. Execute a preparação com -Renovar.")
++        try:
++            san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName)
++        except x509.ExtensionNotFound:
++            san = None
++        if san is None or not set(DNS_NAMES).issubset(san.value.get_values_for_type(x509.DNSName)):
++            raise ValueError(f"O certificado precisa cobrir {STUDIO_HOST}. Execute com -Renovar.")
+     else:
+         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+         identity = x509.Name(
+             [
+-                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
++                x509.NameAttribute(NameOID.COMMON_NAME, STUDIO_HOST),
+                 x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AI Shorts Studio"),
+             ]
+         )
+@@ -60,7 +69,7 @@
+             .add_extension(
+                 x509.SubjectAlternativeName(
+                     [
+-                        x509.DNSName("localhost"),
++                        *(x509.DNSName(name) for name in DNS_NAMES),
+                         x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                         x509.IPAddress(ipaddress.ip_address("::1")),
+                     ]
+diff --git a/tests/test_studio_instagram.py b/tests/test_studio_instagram.py
+--- a/tests/test_studio_instagram.py
++++ b/tests/test_studio_instagram.py
+@@ -17,7 +17,7 @@
+ from autoclip.db import store as clip_db
+ from autoclip.db.models import Clip, Export, Job, Source, new_id
+ from autoclip.instagram import api as routes
+-from autoclip.instagram import worker
++from autoclip.instagram import tls, worker
+ from autoclip.instagram.media import sha256
+ from autoclip.instagram.meta import (
+     DEFAULT_REDIRECT,
+@@ -36,7 +36,7 @@
+ from cryptography import x509
+ from fastapi.testclient import TestClient
+ 
+-ORIGIN = "https://localhost:8000"
++ORIGIN = "https://localhost.localdomain:8000"
+ PREFIX = "/api/instagram"
+ HEADERS = {"Origin": ORIGIN, "X-Studio-Local": "1"}
+ EPOCH = 1_700_000_000
+@@ -223,6 +223,46 @@
+     start = client.post(PREFIX + "/oauth/start", headers=HEADERS, json={})
+     assert start.status_code == 503
+     assert "HTTPS" in start.json()["detail"]
++
++
++def test_configured_alias_is_default_and_old_origin_cannot_start_login(client, monkeypatch):
++    monkeypatch.delenv("AI_SHORTS_META_REDIRECT_URI", raising=False)
++    assert DEFAULT_REDIRECT == ORIGIN + PREFIX + "/oauth/callback"
++    assert client.get(PREFIX + "/status").json()["login_origin"] == ORIGIN
++    _, query = start_login(client)
++    assert query["redirect_uri"] == [DEFAULT_REDIRECT]
++
++    old_origin = "https://localhost:8000"
++    response = client.post(
++        old_origin + PREFIX + "/oauth/start",
++        headers={**HEADERS, "Origin": old_origin},
++        json={},
++    )
++    assert response.status_code == 409
++    assert ORIGIN in response.json()["detail"]
++
++
++def test_callback_requires_its_configured_hostname_even_with_a_valid_state(client, monkeypatch):
++    def not_called(_request):
++        pytest.fail("The old hostname must not exchange a code for the registered redirect")
++
++    mock_meta(monkeypatch, not_called)
++    _, query = start_login(client)
++    state = query["state"][0]
++    response = client.get(
++        "https://localhost:8000" + PREFIX + "/oauth/callback",
++        params={"state": state, "code": "unused"},
++        headers={"Cookie": f"{routes.STATE_COOKIE}={state}"},
++    )
++    assert response.status_code == 303
++    assert response.headers["location"].endswith("conexao=sessao")
++
++
++def test_new_hostname_does_not_allow_non_loopback_clients():
++    with TestClient(
++        create_app(), base_url=ORIGIN, client=("192.0.2.10", 50000)
++    ) as remote:
++        assert remote.get(PREFIX + "/status").status_code == 403
+ 
+ 
+ def test_expired_state_does_not_exchange_the_code(client, monkeypatch):
+@@ -385,14 +425,31 @@
+ 
+ def test_local_certificate_matches_its_private_key_and_is_not_a_ca(tmp_path):
+     public, digest = prepare_certificate(tmp_path)
++    assert public.name == "localhost.localdomain.cer"
+     assert prepare_certificate(tmp_path) == (public, digest)
+     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+     context.load_cert_chain(tmp_path / SERVER_CERT)
+     certificate = x509.load_der_x509_certificate(public.read_bytes())
+     assert certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca is False
+     san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+-    assert san.get_values_for_type(x509.DNSName) == ["localhost"]
++    assert "localhost.localdomain" in san.get_values_for_type(x509.DNSName)
++    assert "localhost" in san.get_values_for_type(x509.DNSName)
+     assert prepare_certificate(tmp_path, renew=True)[1] != digest
++
++
++def test_legacy_certificate_files_are_preserved_when_preparing_the_new_hostname(
++    tmp_path, monkeypatch
++):
++    with monkeypatch.context() as legacy:
++        legacy.setattr(tls, "SERVER_CERT", "localhost-server.pem")
++        legacy.setattr(tls, "PUBLIC_CERT", "localhost.cer")
++        legacy.setattr(tls, "DNS_NAMES", ["localhost"])
++        old_public, old_fingerprint = prepare_certificate(tmp_path)
++    old_bundle = (tmp_path / "localhost-server.pem").read_bytes()
++    public, fingerprint = prepare_certificate(tmp_path)
++    assert fingerprint != old_fingerprint
++    assert public != old_public
++    assert (tmp_path / "localhost-server.pem").read_bytes() == old_bundle
+ 
+ 
+ @pytest.mark.parametrize(

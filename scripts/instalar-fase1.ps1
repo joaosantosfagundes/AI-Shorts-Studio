@@ -70,25 +70,39 @@ if (-not (Test-Path -LiteralPath $autoclipRoot)) {
     Move-Item -LiteralPath (Join-Path $downloads "Autoclip-$commit") -Destination $autoclipRoot
 }
 
-foreach ($patchName in @('autoclip-windows-mediapipe.patch', 'autoclip-performance.patch', 'autoclip-studio.patch')) {
-    $patch = Join-Path $PSScriptRoot $patchName
-    $previousErrorPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        # The installed snapshot lives inside the outer project repository.
-        # Explicitly prevent Git from using the outer worktree for apply.
-        $gitScope = @('-C', $autoclipRoot, "--git-dir=$autoclipRoot/.git-patch", "--work-tree=$autoclipRoot")
+$previousErrorPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    # Restrinja o git apply à cópia instalada do AutoClip.
+    $gitScope = @('-C', $autoclipRoot, "--git-dir=$autoclipRoot/.git-patch", "--work-tree=$autoclipRoot")
+    $patchNames = @(
+        'autoclip-windows-mediapipe.patch',
+        'autoclip-performance.patch',
+        'autoclip-studio.patch',
+        'autoclip-instagram-unified.patch',
+        'autoclip-instagram-localdomain.patch',
+        'autoclip-instagram-oauth.patch'
+    )
+    # Os patches seguintes podem substituir o contexto dos anteriores.
+    $nextPatch = 0
+    for ($index = $patchNames.Count - 1; $index -ge 0; $index--) {
+        $patch = Join-Path $PSScriptRoot $patchNames[$index]
         & git.exe @gitScope apply --reverse --check $patch 2>$null
-        $patchApplied = $LASTEXITCODE -eq 0
-        if (-not $patchApplied) {
-            & git.exe @gitScope apply --check $patch
-            Assert-ExitCode "Verificação de $patchName"
-            & git.exe @gitScope apply $patch
-            Assert-ExitCode "Aplicação de $patchName"
+        if ($LASTEXITCODE -eq 0) {
+            $nextPatch = $index + 1
+            break
         }
-    } finally {
-        $ErrorActionPreference = $previousErrorPreference
     }
+    for ($index = $nextPatch; $index -lt $patchNames.Count; $index++) {
+        $patchName = $patchNames[$index]
+        $patch = Join-Path $PSScriptRoot $patchName
+        & git.exe @gitScope apply --check $patch
+        Assert-ExitCode "Verificação de $patchName"
+        & git.exe @gitScope apply $patch
+        Assert-ExitCode "Aplicação de $patchName"
+    }
+} finally {
+    $ErrorActionPreference = $previousErrorPreference
 }
 
 if (-not (Test-Path -LiteralPath $pythonExe)) {

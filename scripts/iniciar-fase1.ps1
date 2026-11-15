@@ -74,6 +74,33 @@ try {
     }
 
     $serveArgs = @('serve', '--host', '127.0.0.1', '--port', '8000')
+    if ((-not $env:AI_SHORTS_META_REDIRECT_URI) -or ($env:AI_SHORTS_META_REDIRECT_URI -in @(
+        'https://localhost:8000/api/instagram/oauth/callback',
+        'http://localhost:8000/api/instagram/oauth/callback'
+    ))) {
+        $env:AI_SHORTS_META_REDIRECT_URI = $metaRedirectUri
+    }
+    $metaTlsBundle = Join-Path $metaTlsDir "$metaLocalHostname-server.pem"
+    if (Test-Path -LiteralPath $metaTlsBundle -PathType Leaf) {
+        $serveArgs += @('--ssl-certfile', $metaTlsBundle)
+        $resolved = @()
+        try {
+            $resolved = @([Net.Dns]::GetHostAddresses($metaLocalHostname).IPAddressToString)
+        } catch {
+            # O Clipador pode abrir pelo nome localhost enquanto o alias está pendente.
+        }
+        if (($resolved -contains '127.0.0.1') -and -not ($resolved | Where-Object { $_ -ne '127.0.0.1' })) {
+            $serveArgs += @('--browser-host', $metaLocalHostname)
+        } else {
+            Write-Warning "$metaLocalHostname precisa apontar para 127.0.0.1. Edite o arquivo hosts conforme docs/instagram-meta.md."
+        }
+    } else {
+        $previousTlsBundle = Join-Path $metaTlsDir 'localhost-server.pem'
+        if (Test-Path -LiteralPath $previousTlsBundle -PathType Leaf) {
+            $serveArgs += @('--ssl-certfile', $previousTlsBundle)
+            Write-Warning 'Para usar o Instagram, prepare o certificado de localhost.localdomain com scripts/preparar-https-instagram.ps1.'
+        }
+    }
     if ($SemNavegador) { $serveArgs += '--no-open' }
     & $autoClipExe @serveArgs
     if ($LASTEXITCODE -ne 0) {

@@ -1,0 +1,1950 @@
+diff --git a/backend/autoclip/cli.py b/backend/autoclip/cli.py
+--- a/backend/autoclip/cli.py
++++ b/backend/autoclip/cli.py
+@@ -636,6 +636,10 @@
+     open_browser: bool = typer.Option(
+         True, "--open/--no-open", help="Open a browser once the server is up."
+     ),
++    ssl_certfile: Path | None = typer.Option(
++        None, "--ssl-certfile", exists=True, dir_okay=False,
++        help="PEM com certificado e chave privada do servidor HTTPS local.",
++    ),
+ ) -> None:
+     """Start the AutoClip web app."""
+     import threading
+@@ -655,7 +659,8 @@
+             "  [cyan]cd frontend && npm install && npm run build[/cyan]\n"
+         )
+ 
+-    url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
++    scheme = "https" if ssl_certfile else "http"
++    url = f"{scheme}://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
+     console.print(f"[green]AutoClip[/green] starting on [cyan]{url}[/cyan]")
+ 
+     if host == "0.0.0.0":  # noqa: S104
+@@ -674,6 +679,8 @@
+         port=port,
+         reload=reload,
+         log_level="info",
++        ssl_certfile=str(ssl_certfile) if ssl_certfile else None,
++        proxy_headers=ssl_certfile is None,
+     )
+ 
+ 
+diff --git a/backend/autoclip/instagram/api.py b/backend/autoclip/instagram/api.py
+--- a/backend/autoclip/instagram/api.py
++++ b/backend/autoclip/instagram/api.py
+@@ -10,7 +10,7 @@
+ import secrets
+ import threading
+ import time
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from datetime import datetime
+ from typing import Annotated, Literal
+ from urllib.parse import urlsplit
+@@ -23,13 +23,12 @@
+ from .meta import (
+     CALLBACK,
+     LOOPBACK_HOSTS,
+-    AccountGrant,
++    Authorization,
+     InstagramError,
+     MetaClient,
+     MetaConfig,
+-    UserToken,
+ )
+-from .store import StoreConflict, Vault, local_store
++from .store import StoreConflict, Vault, authorization_status, local_store, require_token
+ from .worker import http_client, refresh_credentials
+ 
+ PREFIX = "/api/instagram"
+@@ -42,11 +41,12 @@
+     "Cross-Origin-Resource-Policy": "same-origin",
+ }
+ ID = re.compile(r"[0-9a-f]{16}")
++OAUTH_TOKEN_PATHS = (CALLBACK, "/oauth/access_token", "/debug_token", "/system_user_access_tokens")
+ 
+ 
+ class SensitiveRequests(logging.Filter):
+     def filter(self, record: logging.LogRecord) -> bool:
+-        return not any(value in record.getMessage() for value in (CALLBACK, "/oauth/access_token"))
++        return not any(value in record.getMessage() for value in OAUTH_TOKEN_PATHS)
+ 
+ 
+ def protect_oauth_logs() -> None:
+@@ -66,16 +66,11 @@
+         valid = False
+     if not valid or not request.client or request.client.host not in LOOPBACK_HOSTS:
+         raise HTTPException(403, "Abra o AI Shorts Studio pelo endereço local.")
+-    if request.method not in {"GET", "HEAD"}:
+-        allowed = {f"{request.url.scheme}://{host}"}
+-        config = MetaConfig.load()
+-        if not config.problem and urlsplit(config.redirect).netloc == host:
+-            allowed.add(config.origin)
+-        if (
+-            request.headers.get("x-studio-local") != "1"
+-            or request.headers.get("origin") not in allowed
+-        ):
+-            raise HTTPException(403, "A solicitação deve partir do painel local.")
++    if request.method not in {"GET", "HEAD"} and (
++        request.headers.get("x-studio-local") != "1"
++        or request.headers.get("origin") != f"{request.url.scheme}://{host}"
++    ):
++        raise HTTPException(403, "A solicitação deve partir do painel local.")
+ 
+ 
+ router = APIRouter(prefix=PREFIX, dependencies=[Depends(only_local)])
+@@ -107,12 +102,28 @@
+     return hashlib.sha256(state.encode()).hexdigest()
+ 
+ 
++def _state_key(config: MetaConfig, state: str) -> str:
++    return _digest(f"{config.app_id}:{config.config_id}:{config.redirect}:{state}")
++
++
++def _is_login_origin(request: Request, config: MetaConfig) -> bool:
++    return f"{request.url.scheme}://{request.headers.get('host')}" == config.origin
++
++
+ @dataclass
+ class PendingGrant:
+     app_id: str
+-    accounts: list[AccountGrant]
+-    user: UserToken
++    config_id: str
++    redirect: str
++    authorization: Authorization
+     expires: int
++
++    def matches(self, config: MetaConfig) -> bool:
++        return (
++            self.app_id == config.app_id
++            and self.config_id == config.config_id
++            and self.redirect == config.redirect
++        )
+ 
+ 
+ _pending: dict[str, PendingGrant] = {}
+@@ -133,7 +144,7 @@
+ 
+ def _oauth_result(status: str) -> RedirectResponse:
+     response = RedirectResponse(f"/instagram?conexao={status}", status_code=303, headers=PRIVATE)
+-    response.delete_cookie(STATE_COOKIE, path=CALLBACK)
++    response.delete_cookie(STATE_COOKIE, path=CALLBACK, secure=True, httponly=True, samesite="lax")
+     return response
+ 
+ 
+@@ -160,24 +171,55 @@
+ @router.get("/accounts")
+ def accounts(response: Response) -> list[dict]:
+     response.headers.update(PRIVATE)
+-    return local_store().accounts()
++    config = MetaConfig.load()
++    store = local_store()
++    vault = Vault(store.home, config.app_id)
++    now = int(time.time())
++    public = []
++    for account in store.accounts():
++        state = authorization_status(account, config, now)
++        if state == "connected":
++            try:
++                if config.problem:
++                    state = "unavailable"
++                elif not vault.get(account["id"]):
++                    state = "reconnect"
++            except InstagramError:
++                state = "unavailable"
++        public.append(
++            {
++                "id": account["id"],
++                "username": account["username"],
++                "authorization": state,
++                "expires_at": account["token_expires_at"],
++                "can_renew": state == "connected" and bool(account["can_renew"]),
++            }
++        )
++    return public
++
++
++class OAuthStart(BaseModel):
++    account_id: str | None = Field(default=None, pattern=r"^[0-9]{1,32}$")
+ 
+ 
+ @router.post("/oauth/start")
+-def start_oauth(request: Request, response: Response) -> dict:
++def start_oauth(request: Request, response: Response, body: OAuthStart | None = None) -> dict:
+     config = _config()
++    store = local_store()
++    target = body.account_id if body else None
+     try:
+         Vault.backend()
+-    except InstagramError as error:
+-        raise _problem(error) from None
+-    host = request.headers.get("host")
+-    if host != urlsplit(config.redirect).netloc or request.headers.get("origin") != config.origin:
++        if target:
++            store.account(target)
++    except (InstagramError, KeyError) as error:
++        raise _problem(error) from None
++    if not _is_login_origin(request, config):
+         raise HTTPException(409, f"Abra {config.origin}/instagram para conectar uma conta.")
+     key, _ = _pending_grant(request)
+     with _pending_lock:
+         _pending.pop(key, None)
+     state = secrets.token_urlsafe(32)
+-    local_store().start_oauth(_digest(state), int(time.time()))
++    store.start_oauth(_state_key(config, state), int(time.time()), target)
+     response.headers.update(PRIVATE)
+     response.set_cookie(
+         STATE_COOKIE,
+@@ -185,7 +227,7 @@
+         max_age=COOKIE_LIFETIME,
+         httponly=True,
+         samesite="lax",
+-        secure=config.redirect.startswith("https:"),
++        secure=True,
+         path=CALLBACK,
+     )
+     return {"url": config.login_url(state)}
+@@ -198,22 +240,26 @@
+     stored = request.cookies.get(STATE_COOKIE, "")
+     if (
+         config.problem
+-        or request.headers.get("host") != urlsplit(config.redirect).netloc
++        or not _is_login_origin(request, config)
++        or len(request.query_params.getlist("state")) != 1
+         or not re.fullmatch(r"[A-Za-z0-9_-]{43}", state)
+         or not re.fullmatch(r"[A-Za-z0-9_-]{43}", stored)
+         or not hmac.compare_digest(state, stored)
+     ):
+         return _oauth_result("sessao")
+-    if not local_store().consume_oauth(_digest(state), int(time.time())):
++    login = local_store().consume_oauth(_state_key(config, state), int(time.time()))
++    if login is None:
+         return _oauth_result("sessao")
+     code = request.query_params.get("code", "")
+-    if request.query_params.get("error") or not 1 <= len(code) <= 4096:
++    if (
++        request.query_params.get("error")
++        or len(request.query_params.getlist("code")) != 1
++        or not 1 <= len(code) <= 4096
++    ):
+         return _oauth_result("cancelada")
+     try:
+         with http_client() as http:
+-            meta = MetaClient(config, http)
+-            user = meta.exchange(code)
+-            grants = meta.grants(user.value)
++            authorization = MetaClient(config, http).exchange(code)
+     except InstagramError as error:
+         if error.retry:
+             return _oauth_result("rede")
+@@ -221,13 +267,20 @@
+             return _oauth_result("acesso")
+         logging.getLogger(__name__).warning("Retorno da Meta: %s", error)
+         return _oauth_result("permissoes")
+-    if not grants:
++    if not authorization.accounts:
+         return _oauth_result("sem-contas")
++    if target := login["account_id"]:
++        selected = [account for account in authorization.accounts if account.id == target]
++        if not selected:
++            return _oauth_result("outra-conta")
++        authorization = replace(authorization, accounts=selected)
+     now = int(time.time())
+     key = secrets.token_urlsafe(32)
+     with _pending_lock:
+         _prune_grants(now)
+-        _pending[_digest(key)] = PendingGrant(config.app_id, grants, user, now + COOKIE_LIFETIME)
++        _pending[_digest(key)] = PendingGrant(
++            config.app_id, config.config_id, config.redirect, authorization, now + COOKIE_LIFETIME
++        )
+     response = _oauth_result("selecionar")
+     response.set_cookie(
+         GRANTS_COOKIE,
+@@ -235,7 +288,7 @@
+         max_age=COOKIE_LIFETIME,
+         httponly=True,
+         samesite="strict",
+-        secure=config.redirect.startswith("https:"),
++        secure=True,
+         path=PREFIX,
+     )
+     return response
+@@ -244,13 +297,16 @@
+ @router.get("/oauth/accounts")
+ def oauth_accounts(request: Request, response: Response) -> list[dict]:
+     response.headers.update(PRIVATE)
++    config = MetaConfig.load()
+     _, entry = _pending_grant(request)
+-    if not entry or entry.app_id != MetaConfig.load().app_id:
++    if (
++        config.problem
++        or not _is_login_origin(request, config)
++        or not entry
++        or not entry.matches(config)
++    ):
+         return []
+-    return [
+-        {"id": grant.id, "username": grant.username, "page_name": grant.page_name}
+-        for grant in entry.accounts
+-    ]
++    return [{"id": grant.id, "username": grant.username} for grant in entry.authorization.accounts]
+ 
+ 
+ class AccountSelection(BaseModel):
+@@ -260,22 +316,32 @@
+ @router.post("/oauth/accounts", status_code=204)
+ def select_accounts(selection: AccountSelection, request: Request) -> Response:
+     config = _config()
++    if not _is_login_origin(request, config):
++        raise HTTPException(409, f"Abra {config.origin}/instagram para conectar uma conta.")
+     key, entry = _pending_grant(request)
+-    if not entry or entry.app_id != config.app_id:
++    if not entry or not entry.matches(config):
+         raise HTTPException(409, "A seleção expirou. Abra o login da Meta novamente.")
+     ids = set(selection.ids)
+-    grants = [grant for grant in entry.accounts if grant.id in ids]
++    grants = [grant for grant in entry.authorization.accounts if grant.id in ids]
+     if len(grants) != len(ids):
+         raise HTTPException(422, "Selecione somente contas autorizadas no login da Meta.")
+     store = local_store()
+-    try:
+-        store.connect_accounts(grants, entry.user, Vault(store.home, config.app_id))
++    with _pending_lock:
++        if _pending.pop(key, None) is not entry:
++            raise HTTPException(409, "A seleção já foi usada. Atualize o painel.")
++    try:
++        store.connect_accounts(
++            grants, entry.authorization, config, Vault(store.home, config.app_id), int(time.time())
++        )
+     except (InstagramError, StoreConflict, OSError) as error:
+-        raise _problem(error) from None
+-    with _pending_lock:
+-        _pending.pop(key, None)
++        with _pending_lock:
++            if entry.expires > int(time.time()):
++                _pending[key] = entry
++        raise _problem(error) from None
+     response = Response(status_code=204, headers=PRIVATE)
+-    response.delete_cookie(GRANTS_COOKIE, path=PREFIX)
++    response.delete_cookie(
++        GRANTS_COOKIE, path=PREFIX, secure=True, httponly=True, samesite="strict"
++    )
+     return response
+ 
+ 
+@@ -293,18 +359,16 @@
+                 int(time.time()),
+             )
+     except (InstagramError, StoreConflict, KeyError) as error:
+-        if isinstance(error, InstagramError) and error.auth:
+-            store.auth_needed(account_id)
+         raise _problem(error) from None
+     return Response(status_code=204, headers=PRIVATE)
+ 
+ 
+ @router.delete("/accounts/{account_id}", status_code=204)
+ def disconnect_account(account_id: str) -> Response:
+-    config = _config()
+-    store = local_store()
+-    try:
+-        store.disconnect(account_id, Vault(store.home, config.app_id), int(time.time()))
++    config = MetaConfig.load()
++    store = local_store()
++    try:
++        store.disconnect(account_id, config.app_id, int(time.time()))
+     except (InstagramError, StoreConflict, KeyError) as error:
+         raise _problem(error) from None
+     return Response(status_code=204, headers=PRIVATE)
+@@ -439,10 +503,13 @@
+     store = local_store()
+     try:
+         row = store.reel(reel_id)
+-        if not body.account_id or not Vault(store.home, config.app_id).get(body.account_id):
+-            raise StoreConflict("Reconecte a conta de destino para aprovar este Reel.")
+         verify_media(store.media(reel_id), row)
+-        store.save_draft(reel_id, int(time.time()), body.values(), approve=True)
++        store.save_draft(
++            reel_id,
++            int(time.time()),
++            body.values(),
++            approval=(config, Vault(store.home, config.app_id)),
++        )
+         return _public_reel(store.reel(reel_id))
+     except (InstagramError, StoreConflict, KeyError, OSError) as error:
+         raise _problem(error) from None
+@@ -513,11 +580,15 @@
+         if row["status"] != "uncertain" or not row["container_id"]:
+             raise StoreConflict("Este Reel não precisa de verificação.")
+         account = store.account(row["account_id"])
+-        credentials = Vault(store.home, config.app_id).get(account["id"])
+-        if not account["connected"] or not credentials:
+-            raise StoreConflict("Reconecte a conta para verificar o Reel.")
+-        with http_client() as http:
+-            state = MetaClient(config, http).status(row["container_id"], credentials.page)
++        vault = Vault(store.home, config.app_id)
++        token = require_token(account, config, vault, int(time.time()))
++        try:
++            with http_client() as http:
++                state = MetaClient(config, http).status(row["container_id"], token)
++        except InstagramError as error:
++            if error.auth:
++                store.auth_needed(account["id"], config, vault, token)
++            raise
+         if state in {"PUBLISHED", "EXPIRED", "ERROR"}:
+             store.mark_reconciled(reel_id, int(time.time()), published=state == "PUBLISHED")
+         return _public_reel(store.reel(reel_id))
+diff --git a/backend/autoclip/instagram/meta.py b/backend/autoclip/instagram/meta.py
+--- a/backend/autoclip/instagram/meta.py
++++ b/backend/autoclip/instagram/meta.py
+@@ -1,4 +1,4 @@
+-"""Facebook Login for Business and the Instagram Graph API."""
++"""Instagram API with Unified Login."""
+ 
+ from __future__ import annotations
+ 
+@@ -14,13 +14,10 @@
+ import httpx
+ 
+ CALLBACK = "/api/instagram/oauth/callback"
++DEFAULT_REDIRECT = "https://localhost:8000" + CALLBACK
+ LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+-PERMISSIONS = {
+-    "instagram_basic",
+-    "instagram_content_publish",
+-    "pages_show_list",
+-    "pages_read_engagement",
+-}
++PUBLISH_SCOPES = {"instagram_basic", "instagram_content_publish"}
++RENEW_SCOPE = "business_management"
+ 
+ 
+ class InstagramError(RuntimeError):
+@@ -37,7 +34,7 @@
+     app_id: str
+     config_id: str
+     secret: str = field(repr=False)
+-    redirect: str = "http://localhost:8000" + CALLBACK
++    redirect: str = DEFAULT_REDIRECT
+     version: str = "v27.0"
+     publishing: bool = False
+ 
+@@ -48,7 +45,7 @@
+             app_id=os.environ.get(prefix + "APP_ID", "").strip(),
+             config_id=os.environ.get(prefix + "CONFIG_ID", "").strip(),
+             secret=os.environ.get(prefix + "APP_SECRET", "").strip(),
+-            redirect=os.environ.get(prefix + "REDIRECT_URI", "http://localhost:8000" + CALLBACK),
++            redirect=os.environ.get(prefix + "REDIRECT_URI", DEFAULT_REDIRECT).strip(),
+             version=os.environ.get(prefix + "API_VERSION", "v27.0"),
+             publishing=os.environ.get("AI_SHORTS_INSTAGRAM_PUBLISH") == "1",
+         )
+@@ -59,22 +56,7 @@
+             return "Configure o ID do aplicativo, o ID da configuração e o segredo da Meta."
+         if not re.fullmatch(r"v[0-9]{1,2}\.0", self.version):
+             return "A versão da API Graph deve estar no formato v27.0."
+-        try:
+-            url = urlsplit(self.redirect)
+-            port = url.port
+-        except ValueError:
+-            return "O endereço de retorno da Meta é inválido."
+-        if (
+-            url.scheme not in {"http", "https"}
+-            or url.hostname not in LOOPBACK_HOSTS
+-            or (port is not None and port <= 0)
+-            or url.path != CALLBACK
+-            or url.query
+-            or url.fragment
+-            or url.username
+-        ):
+-            return "Use um endereço local de retorno da Meta que termine em " + CALLBACK + "."
+-        return None
++        return redirect_problem(self.redirect)
+ 
+     @property
+     def origin(self) -> str:
+@@ -88,25 +70,51 @@
+                 "config_id": self.config_id,
+                 "redirect_uri": self.redirect,
+                 "response_type": "code",
++                "prompt": "login",
+                 "state": state,
+             }
+         )
+-        return f"https://www.facebook.com/{self.version}/dialog/oauth?{params}"
++        return f"https://www.facebook.com/dialog/oauth?{params}"
++
++
++def redirect_problem(redirect: str) -> str | None:
++    try:
++        url = urlsplit(redirect)
++        port = url.port
++    except ValueError:
++        return "O endereço de retorno da Meta é inválido."
++    if (
++        url.scheme != "https"
++        or url.hostname not in LOOPBACK_HOSTS
++        or (port is not None and port <= 0)
++        or url.path != CALLBACK
++        or url.query
++        or url.fragment
++        or url.username is not None
++        or redirect != f"https://{url.netloc}{CALLBACK}"
++    ):
++        return "O Unified Login exige um retorno HTTPS local. Use " + DEFAULT_REDIRECT + "."
++    return None
+ 
+ 
+ @dataclass(frozen=True)
+ class AccountGrant:
+     id: str
+-    page_id: str
+     username: str
+-    page_name: str
+-    page_token: str = field(repr=False)
+ 
+ 
+ @dataclass(frozen=True)
+-class UserToken:
++class SystemToken:
+     value: str = field(repr=False)
+     expires_at: int | None
++    can_renew: bool
++
++
++@dataclass(frozen=True)
++class Authorization:
++    business_id: str
++    token: SystemToken
++    accounts: list[AccountGrant]
+ 
+ 
+ def meta_id(value: object) -> bool:
+@@ -155,7 +163,7 @@
+             )
+         if code in {10, 200} or response.status_code == 403:
+             raise InstagramError(
+-                "A Meta recusou as permissões. Revise a conta e a Página." + detail
++                "A Meta recusou as permissões. Confira a conta e o portfólio empresarial." + detail
+             )
+         raise InstagramError("A Meta recusou a solicitação." + detail)
+ 
+@@ -182,67 +190,101 @@
+             data=data,
+         )
+ 
+-    def exchange(self, code: str) -> UserToken:
+-        app = {"client_id": self.config.app_id, "client_secret": self.config.secret}
+-        first = self._graph(
++    def exchange(self, code: str) -> Authorization:
++        result = self._graph(
+             "GET",
+             "oauth/access_token",
+             params={
+-                **app,
+-                "redirect_uri": self.config.redirect,
++                "client_id": self.config.app_id,
++                "client_secret": self.config.secret,
+                 "code": code,
+             },
+         )
+-        short_token = first.get("access_token")
+-        if not isinstance(short_token, str) or not short_token:
+-            raise InstagramError("A Meta não forneceu o token de usuário.")
+-        long = self._graph(
++        return self._authorization(result)
++
++    def _inspect_token(self, value: str, fallback_expiry: int | None) -> SystemToken:
++        metadata = self._graph(
+             "GET",
+-            "oauth/access_token",
+-            params={
+-                **app,
+-                "grant_type": "fb_exchange_token",
+-                "fb_exchange_token": short_token,
++            "debug_token",
++            f"{self.config.app_id}|{self.config.secret}",
++            params={"input_token": value},
++        ).get("data")
++        if (
++            not isinstance(metadata, dict)
++            or metadata.get("is_valid") is not True
++            or str(metadata.get("app_id", "")) != self.config.app_id
++        ):
++            raise InstagramError("A Meta não validou o token deste aplicativo.", auth=True)
++        scopes = set(metadata.get("scopes") or [])
++        scopes.update(item.get("scope") for item in (metadata.get("granular_scopes") or []))
++        if missing := PUBLISH_SCOPES - scopes:
++            raise InstagramError(
++                "Autorize as permissões " + ", ".join(sorted(missing)) + " na configuração da Meta."
++            )
++        expiry = metadata.get("expires_at")
++        expiry = (expiry or None) if type(expiry) is int and expiry >= 0 else fallback_expiry
++        if expiry is not None and expiry <= int(time.time()):
++            raise InstagramError("O token de usuário do sistema expirou.", auth=True)
++        return SystemToken(value, expiry, RENEW_SCOPE in scopes)
++
++    def _authorization(self, result: dict) -> Authorization:
++        value = result.get("access_token")
++        if (
++            not isinstance(value, str)
++            or not value
++            or not value.isascii()
++            or not value.isprintable()
++        ):
++            raise InstagramError("A Meta não forneceu um token de usuário do sistema válido.")
++        lifetime = result.get("expires_in")
++        fallback = int(time.time()) + lifetime if type(lifetime) is int and lifetime > 0 else None
++        business_id = self._graph("GET", "me", value, params={"fields": "client_business_id"}).get(
++            "client_business_id"
++        )
++        if not meta_id(business_id):
++            raise InstagramError(
++                "Use uma configuração Instagram Login Compatible com token de usuário do sistema."
++            )
++        token = self._inspect_token(value, fallback)
++        return Authorization(business_id, token, self._assigned_accounts(value))
++
++    def _assigned_accounts(self, token: str) -> list[AccountGrant]:
++        params: dict = {"fields": "id,username", "limit": 100}
++        accounts: dict[str, AccountGrant] = {}
++        cursors = set()
++        while True:
++            response = self._graph("GET", "me/assigned_instagram_accounts", token, params=params)
++            for account in response.get("data", []):
++                username = account.get("username")
++                if meta_id(account.get("id")) and isinstance(username, str) and username:
++                    accounts[account["id"]] = AccountGrant(account["id"], username)
++            paging = response.get("paging") or {}
++            after = (paging.get("cursors") or {}).get("after")
++            if not paging.get("next") or not isinstance(after, str) or after in cursors:
++                return list(accounts.values())
++            cursors.add(after)
++            params["after"] = after
++
++    def renew(self, account: str, business_id: str, token: str, *, expiring: bool) -> SystemToken:
++        if not meta_id(account) or not meta_id(business_id):
++            raise InstagramError("O vínculo com o portfólio é inválido. Reconecte a conta.")
++        result = self._graph(
++            "POST",
++            f"{business_id}/system_user_access_tokens",
++            token,
++            data={
++                "asset": account,
++                "scope": ",".join(sorted(PUBLISH_SCOPES | {RENEW_SCOPE})),
++                "fetch_only": "false",
++                "set_token_expires_in_60_days": "true" if expiring else "false",
+             },
+         )
+-        token = long.get("access_token")
+-        if not isinstance(token, str) or not token:
+-            raise InstagramError("A Meta não forneceu o token de longa duração.")
+-        lifetime = long.get("expires_in")
+-        expiry = int(time.time()) + lifetime if isinstance(lifetime, int) and lifetime > 0 else None
+-        return UserToken(token, expiry)
+-
+-    def grants(self, user_token: str) -> list[AccountGrant]:
+-        permissions = self._graph("GET", "me/permissions", user_token).get("data", [])
+-        granted = {item["permission"] for item in permissions if item.get("status") == "granted"}
+-        if missing := PERMISSIONS - granted:
+-            raise InstagramError("Autorize estas permissões na Meta: " + ", ".join(sorted(missing)))
+-        params: dict = {
+-            "fields": "id,name,tasks,access_token,instagram_business_account{id,username}",
+-            "limit": 100,
+-        }
+-        accounts: dict[str, AccountGrant] = {}
+-        while True:
+-            response = self._graph("GET", "me/accounts", user_token, params=params)
+-            for page in response.get("data", []):
+-                ig = page.get("instagram_business_account") or {}
+-                if (
+-                    not meta_id(ig.get("id"))
+-                    or not meta_id(page.get("id"))
+-                    or not page.get("access_token")
+-                    or not ig.get("username")
+-                    or not {"MANAGE", "CREATE_CONTENT"}.intersection(page.get("tasks", []))
+-                ):
+-                    continue
+-                accounts[ig["id"]] = AccountGrant(
+-                    ig["id"], page["id"], ig["username"], page.get("name", ""), page["access_token"]
+-                )
+-            # Use the cursor with the fixed host. Pagination URLs can contain access tokens.
+-            paging = response.get("paging", {})
+-            after = paging.get("cursors", {}).get("after")
+-            if not paging.get("next") or not after or after == params.get("after"):
+-                return list(accounts.values())
+-            params["after"] = after
++        authorized = self._authorization(result)
++        if authorized.business_id != business_id or not any(
++            grant.id == account for grant in authorized.accounts
++        ):
++            raise InstagramError("A Meta não confirmou a conta de destino após a renovação.")
++        return authorized.token
+ 
+     @staticmethod
+     def _response_id(body: dict) -> str:
+diff --git a/backend/autoclip/instagram/store.py b/backend/autoclip/instagram/store.py
+--- a/backend/autoclip/instagram/store.py
++++ b/backend/autoclip/instagram/store.py
+@@ -7,13 +7,12 @@
+ import sqlite3
+ from collections.abc import Iterator
+ from contextlib import closing, contextmanager
+-from dataclasses import dataclass, field
+ from functools import lru_cache
+ from pathlib import Path
+ 
+ from .. import db, paths
+ from ..db.models import new_id
+-from .meta import AccountGrant, InstagramError, UserToken
++from .meta import AccountGrant, Authorization, InstagramError, MetaConfig, SystemToken
+ 
+ SCHEMA = """
+ CREATE TABLE IF NOT EXISTS accounts (
+@@ -21,7 +20,9 @@
+     connected INTEGER NOT NULL, auth_needed INTEGER NOT NULL DEFAULT 0,
+     user_expires_at INTEGER
+ );
+-CREATE TABLE IF NOT EXISTS oauth_states (digest TEXT PRIMARY KEY, expires INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS oauth_states (
++    digest TEXT PRIMARY KEY, expires INTEGER NOT NULL, account_id TEXT
++);
+ CREATE TABLE IF NOT EXISTS reels (
+     id TEXT PRIMARY KEY,
+     export_id TEXT NOT NULL, title TEXT NOT NULL, sha256 TEXT NOT NULL,
+@@ -49,16 +50,17 @@
+ """
+ 
+ log = logging.getLogger(__name__)
++UNIFIED_COLUMNS = {
++    "meta_app_id": "TEXT",
++    "meta_config_id": "TEXT",
++    "business_id": "TEXT",
++    "token_expires_at": "INTEGER",
++    "can_renew": "INTEGER NOT NULL DEFAULT 0",
++}
+ 
+ 
+ class StoreConflict(RuntimeError):
+     pass
+-
+-
+-@dataclass(frozen=True)
+-class Credentials:
+-    page: str = field(repr=False)
+-    user: str = field(repr=False)
+ 
+ 
+ class Vault:
+@@ -85,32 +87,29 @@
+             pass
+         raise InstagramError("O Gerenciador de Credenciais do Windows está indisponível.")
+ 
+-    def get(self, account: str) -> Credentials | None:
++    def get(self, account: str) -> str | None:
+         try:
+-            backend = self.backend()
+-            page = backend.get_password(f"{self.service} {account} página", account)
+-            user = backend.get_password(f"{self.service} {account} usuário", account)
+-            return Credentials(page, user) if page and user else None
++            return self.backend().get_password(f"{self.service} Unified {account}", account)
+         except Exception:
+             raise InstagramError(
+                 "Não foi possível ler o cofre de credenciais do Windows."
+             ) from None
+ 
+-    def put(self, account: str, credentials: Credentials) -> None:
++    def put(self, account: str, token: str) -> None:
+         try:
+-            backend = self.backend()
+-            backend.set_password(f"{self.service} {account} página", account, credentials.page)
+-            backend.set_password(f"{self.service} {account} usuário", account, credentials.user)
++            self.backend().set_password(f"{self.service} Unified {account}", account, token)
+         except Exception:
+             raise InstagramError(
+                 "Não foi possível gravar no cofre de credenciais do Windows."
+             ) from None
+ 
+-    def delete(self, account: str) -> None:
++    def delete(self, account: str, *, legacy: bool = False) -> None:
+         try:
+             backend = self.backend()
+-            for suffix in ("página", "usuário"):
+-                target = f"{self.service} {account} {suffix}"
++            targets = [f"{self.service} Unified {account}"]
++            if legacy:
++                targets.extend(f"{self.service} {account} {s}" for s in ("página", "usuário"))
++            for target in targets:
+                 if backend.get_password(target, account) is not None:
+                     backend.delete_password(target, account)
+         except Exception:
+@@ -125,6 +124,14 @@
+         self.filename = home / "publicacoes.sqlite3"
+         with self.connect() as conn:
+             conn.executescript(SCHEMA)
++        with self.connect(write=True) as conn:
++            columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)")}
++            for name, definition in UNIFIED_COLUMNS.items():
++                if name not in columns:
++                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
++            state_columns = {row["name"] for row in conn.execute("PRAGMA table_info(oauth_states)")}
++            if "account_id" not in state_columns:
++                conn.execute("ALTER TABLE oauth_states ADD COLUMN account_id TEXT")
+ 
+     @contextmanager
+     def connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
+@@ -138,19 +145,20 @@
+     def media(self, reel_id: str) -> Path:
+         return self.home / "instagram" / "media" / f"{reel_id}.mp4"
+ 
+-    def start_oauth(self, digest: str, now: int) -> None:
++    def start_oauth(self, digest: str, now: int, account_id: str | None) -> None:
+         with self.connect(write=True) as conn:
+             conn.execute("DELETE FROM oauth_states WHERE expires <= ?", (now,))
+-            conn.execute("INSERT INTO oauth_states VALUES (?, ?)", (digest, now + 600))
+-
+-    def consume_oauth(self, digest: str, now: int) -> bool:
+-        with self.connect(write=True) as conn:
+-            return (
+-                conn.execute(
+-                    "DELETE FROM oauth_states WHERE digest = ? AND expires > ?", (digest, now)
+-                ).rowcount
+-                == 1
+-            )
++            conn.execute(
++                "INSERT INTO oauth_states (digest, expires, account_id) VALUES (?, ?, ?)",
++                (digest, now + 600, account_id),
++            )
++
++    def consume_oauth(self, digest: str, now: int) -> sqlite3.Row | None:
++        with self.connect(write=True) as conn:
++            return conn.execute(
++                "DELETE FROM oauth_states WHERE digest=? AND expires>? RETURNING account_id",
++                (digest, now),
++            ).fetchone()
+ 
+     def accounts(self) -> list[dict]:
+         with self.connect() as conn:
+@@ -163,8 +171,18 @@
+         with self.connect() as conn:
+             return self._get(conn, "accounts", account)
+ 
+-    def connect_accounts(self, grants: list[AccountGrant], user: UserToken, vault: Vault) -> None:
+-        replaced: dict[str, Credentials | None] = {}
++    def connect_accounts(
++        self,
++        grants: list[AccountGrant],
++        authorization: Authorization,
++        config: MetaConfig,
++        vault: Vault,
++        now: int,
++    ) -> None:
++        replaced: dict[str, str | None] = {}
++        token = authorization.token
++        if token.expires_at is not None and token.expires_at <= now:
++            raise StoreConflict("O acesso expirou. Conecte a conta no Instagram novamente.")
+         try:
+             with self.connect(write=True) as conn:
+                 active = {
+@@ -172,18 +190,50 @@
+                 }
+                 if len(active.union(grant.id for grant in grants)) > 2:
+                     raise StoreConflict(
+-                        "O estúdio comporta duas contas. Selecione até duas Páginas na Meta."
++                        "O estúdio comporta duas contas profissionais do Instagram."
+                     )
+                 for grant in grants:
++                    self._require_idle(conn, grant.id, now)
++                    previous = conn.execute(
++                        "SELECT * FROM accounts WHERE id=?", (grant.id,)
++                    ).fetchone()
+                     replaced[grant.id] = vault.get(grant.id)
+-                    vault.put(grant.id, Credentials(grant.page_token, user.value))
++                    vault.put(grant.id, token.value)
+                     conn.execute(
+-                        """INSERT INTO accounts VALUES (?, ?, ?, ?, 1, 0, ?)
+-                           ON CONFLICT(id) DO UPDATE SET page_id=excluded.page_id,
+-                           username=excluded.username, page_name=excluded.page_name,
+-                           connected=1, auth_needed=0, user_expires_at=excluded.user_expires_at""",
+-                        (grant.id, grant.page_id, grant.username, grant.page_name, user.expires_at),
++                        """INSERT INTO accounts (
++                               id, page_id, username, page_name, connected, auth_needed,
++                               meta_app_id, meta_config_id, business_id, token_expires_at, can_renew
++                           ) VALUES (?, '', ?, '', 1, 0, ?, ?, ?, ?, ?)
++                           ON CONFLICT(id) DO UPDATE SET
++                               username=excluded.username, connected=1, auth_needed=0,
++                               meta_app_id=excluded.meta_app_id,
++                               meta_config_id=excluded.meta_config_id,
++                               business_id=excluded.business_id,
++                               token_expires_at=excluded.token_expires_at,
++                               can_renew=excluded.can_renew
++                        """,
++                        (
++                            grant.id,
++                            grant.username,
++                            config.app_id,
++                            config.config_id,
++                            authorization.business_id,
++                            token.expires_at,
++                            token.can_renew,
++                        ),
+                     )
++                    # Old containers may belong to the previous app or portfólio.
++                    # Keep the publish marker and container for any ambiguous send.
++                    if previous and (
++                        not matches_config(previous, config)
++                        or previous["business_id"] != authorization.business_id
++                    ):
++                        conn.execute(
++                            """UPDATE reels SET container_id=NULL, uploaded=0, polls=0, failures=0
++                               WHERE account_id=? AND publish_started=0
++                               AND status IN ('queued','waiting','retry','sending')""",
++                            (grant.id,),
++                        )
+         except Exception:
+             for account, previous in replaced.items():
+                 try:
+@@ -195,19 +245,54 @@
+                     log.warning("Foi necessário interromper a atualização do cofre do Instagram.")
+             raise
+ 
+-    def auth_needed(self, account: str) -> None:
+-        with self.connect(write=True) as conn:
+-            conn.execute("UPDATE accounts SET auth_needed = 1 WHERE id = ?", (account,))
+-
+-    def disconnect(self, account: str, vault: Vault, now: int) -> None:
+-        with self.connect(write=True) as conn:
+-            self._get(conn, "accounts", account)
+-            sending = conn.execute(
+-                "SELECT 1 FROM reels WHERE account_id=? AND status='sending' AND lease_until>?",
+-                (account, now),
+-            ).fetchone()
+-            if sending:
+-                raise StoreConflict("Aguarde a tentativa em andamento para desconectar a conta.")
++    def auth_needed(self, account: str, config: MetaConfig, vault: Vault, token: str) -> None:
++        with self.connect(write=True) as conn:
++            row = self._get(conn, "accounts", account)
++            if matches_config(row, config) and vault.get(account) == token:
++                conn.execute(
++                    "UPDATE accounts SET auth_needed=1 WHERE id=? AND connected=1", (account,)
++                )
++
++    def rotate_token(
++        self,
++        account: str,
++        config: MetaConfig,
++        vault: Vault,
++        previous_token: str,
++        business_id: str,
++        token: SystemToken,
++    ) -> None:
++        with self.connect(write=True) as conn:
++            current = self._get(conn, "accounts", account)
++            if (
++                not current["connected"]
++                or not matches_config(current, config)
++                or current["business_id"] != business_id
++                or vault.get(account) != previous_token
++            ):
++                raise StoreConflict("A conexão mudou. Atualize a página e tente novamente.")
++            vault.put(account, token.value)
++            conn.execute(
++                "UPDATE accounts SET auth_needed=0, token_expires_at=?, can_renew=? WHERE id=?",
++                (token.expires_at, token.can_renew, account),
++            )
++
++    @staticmethod
++    def _require_idle(conn: sqlite3.Connection, account: str, now: int) -> None:
++        sending = conn.execute(
++            "SELECT 1 FROM reels WHERE account_id=? AND status='sending' AND lease_until>?",
++            (account, now),
++        ).fetchone()
++        if sending:
++            raise StoreConflict("Aguarde o fim do envio antes de alterar esta conexão.")
++
++    def disconnect(self, account: str, app_id: str, now: int) -> None:
++        with self.connect(write=True) as conn:
++            current = self._get(conn, "accounts", account)
++            self._require_idle(conn, account, now)
++            credential_app = current["meta_app_id"] or app_id
++            if current["connected"] and credential_app:
++                Vault(self.home, credential_app).delete(account, legacy=True)
+             conn.execute("UPDATE accounts SET connected=0, auth_needed=0 WHERE id=?", (account,))
+             rows = conn.execute(
+                 """SELECT id, publish_started FROM reels
+@@ -224,7 +309,6 @@
+                     lease_until=None,
+                     lease_token=None,
+                 )
+-            vault.delete(account)
+ 
+     @staticmethod
+     def _get(conn: sqlite3.Connection, table: str, item_id: str) -> sqlite3.Row:
+@@ -272,12 +356,19 @@
+                 )
+             ]
+ 
+-    def save_draft(self, reel_id: str, now: int, values: dict, *, approve: bool = False) -> None:
++    def save_draft(
++        self,
++        reel_id: str,
++        now: int,
++        values: dict,
++        *,
++        approval: tuple[MetaConfig, Vault] | None = None,
++    ) -> None:
+         with self.connect(write=True) as conn:
+             row = self._get(conn, "reels", reel_id)
+             if row["status"] != "draft":
+                 raise StoreConflict("Somente rascunhos podem ser editados ou aprovados.")
+-            if approve:
++            if approval:
+                 if (
+                     not values["account_id"]
+                     or values["scheduled_at"] is None
+@@ -285,8 +376,7 @@
+                 ):
+                     raise StoreConflict("Escolha a conta e um horário futuro para publicar.")
+                 account = self._get(conn, "accounts", values["account_id"])
+-                if not account["connected"] or account["auth_needed"]:
+-                    raise StoreConflict("Conecte ou renove a conta de destino antes de aprovar.")
++                require_token(account, *approval, now)
+                 duplicate = conn.execute(
+                     """SELECT 1 FROM reels
+                        WHERE account_id=? AND (export_id=? OR sha256=?) AND id<>?
+@@ -435,6 +525,33 @@
+         self._event(conn, reel, now, status, detail)
+ 
+ 
++def matches_config(account: sqlite3.Row | dict, config: MetaConfig) -> bool:
++    return (
++        bool(account["business_id"])
++        and account["meta_app_id"] == config.app_id
++        and account["meta_config_id"] == config.config_id
++    )
++
++
++def authorization_status(account: sqlite3.Row | dict, config: MetaConfig, now: int) -> str:
++    if not account["connected"]:
++        return "disconnected"
++    if not matches_config(account, config) or account["auth_needed"]:
++        return "reconnect"
++    if account["token_expires_at"] is not None and account["token_expires_at"] <= now:
++        return "expired"
++    return "connected"
++
++
++def require_token(account: sqlite3.Row, config: MetaConfig, vault: Vault, now: int) -> str:
++    status = authorization_status(account, config, now)
++    if status == "expired":
++        raise InstagramError("O acesso expirou. Reconecte a conta pelo Instagram.", auth=True)
++    if status != "connected" or not (token := vault.get(account["id"])):
++        raise InstagramError("Conecte novamente a conta de destino pelo Instagram.", auth=True)
++    return token
++
++
+ @lru_cache(maxsize=8)
+ def _store(home: Path) -> Store:
+     return Store(home)
+diff --git a/backend/autoclip/instagram/tls.py b/backend/autoclip/instagram/tls.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/instagram/tls.py
+@@ -0,0 +1,97 @@
++"""Generate a local-only TLS certificate for the Unified Login callback."""
++
++from __future__ import annotations
++
++import argparse
++import ipaddress
++import os
++import ssl
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from tempfile import NamedTemporaryFile
++
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
++
++SERVER_CERT = "localhost-server.pem"
++PUBLIC_CERT = "localhost.cer"
++
++
++def _replace_file(path: Path, content: bytes) -> None:
++    with NamedTemporaryFile(dir=path.parent, delete=False) as handle:
++        temporary = Path(handle.name)
++        try:
++            handle.write(content)
++            handle.close()
++            os.replace(temporary, path)
++        finally:
++            temporary.unlink(missing_ok=True)
++
++
++def prepare_certificate(directory: Path, *, renew: bool = False) -> tuple[Path, str]:
++    directory.mkdir(parents=True, exist_ok=True)
++    bundle = directory / SERVER_CERT
++    now = datetime.now(UTC)
++    if bundle.exists() and not renew:
++        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(bundle)
++        certificate = x509.load_pem_x509_certificate(bundle.read_bytes())
++        if not certificate.not_valid_before_utc <= now < certificate.not_valid_after_utc:
++            raise ValueError("O certificado venceu. Execute a preparação com -Renovar.")
++    else:
++        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++        identity = x509.Name(
++            [
++                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
++                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AI Shorts Studio"),
++            ]
++        )
++        certificate = (
++            x509.CertificateBuilder()
++            .subject_name(identity)
++            .issuer_name(identity)
++            .public_key(key.public_key())
++            .serial_number(x509.random_serial_number())
++            .not_valid_before(now - timedelta(minutes=5))
++            .not_valid_after(now + timedelta(days=365))
++            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
++            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
++            .add_extension(
++                x509.SubjectAlternativeName(
++                    [
++                        x509.DNSName("localhost"),
++                        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
++                        x509.IPAddress(ipaddress.ip_address("::1")),
++                    ]
++                ),
++                critical=False,
++            )
++            .sign(key, hashes.SHA256())
++        )
++        private_pem = key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.PKCS8,
++            serialization.NoEncryption(),
++        )
++        _replace_file(bundle, certificate.public_bytes(serialization.Encoding.PEM) + private_pem)
++    public = directory / PUBLIC_CERT
++    _replace_file(public, certificate.public_bytes(serialization.Encoding.DER))
++    return public, certificate.fingerprint(hashes.SHA256()).hex().upper()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("directory", type=Path)
++    parser.add_argument("--renew", action="store_true")
++    args = parser.parse_args()
++    try:
++        public, fingerprint = prepare_certificate(args.directory, renew=args.renew)
++    except (OSError, ValueError) as error:
++        parser.exit(1, f"Falha ao preparar o certificado local: {error}\n")
++    print(f"Certificado público: {public}")
++    print(f"SHA-256: {fingerprint}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backend/autoclip/instagram/worker.py b/backend/autoclip/instagram/worker.py
+--- a/backend/autoclip/instagram/worker.py
++++ b/backend/autoclip/instagram/worker.py
+@@ -14,7 +14,7 @@
+ 
+ from .media import verify_media
+ from .meta import InstagramError, MetaClient, MetaConfig
+-from .store import Credentials, Store, StoreConflict, Vault, local_store
++from .store import Store, StoreConflict, Vault, local_store, require_token
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -30,25 +30,22 @@
+ 
+ def refresh_credentials(
+     store: Store, vault: Vault, client: MetaClient, account: str, now: int
+-) -> Credentials:
+-    # Capture the token used, then compare before writing across a reconnect
+-    # (which can supply a different Facebook account for the same Page).
+-    with store.connect() as conn:
+-        row = store._get(conn, "accounts", account)
+-        original = vault.get(account) if row["connected"] else None
+-    if not original or (row["user_expires_at"] is not None and row["user_expires_at"] <= now):
+-        raise InstagramError("Reconecte esta conta pelo login da Meta.", auth=True)
+-    grant = next((grant for grant in client.grants(original.user) if grant.id == account), None)
+-    if not grant or grant.page_id != row["page_id"]:
+-        raise InstagramError("A conta ou Página perdeu a autorização na Meta.", auth=True)
+-    credentials = Credentials(grant.page_token, original.user)
+-    with store.connect(write=True) as conn:
+-        current = store._get(conn, "accounts", account)
+-        if not current["connected"] or vault.get(account) != original:
+-            raise StoreConflict("A conexão mudou. Atualize a página e tente novamente.")
+-        vault.put(account, credentials)
+-        conn.execute("UPDATE accounts SET auth_needed=0 WHERE id=?", (account,))
+-    return credentials
++) -> None:
++    row = store.account(account)
++    original = require_token(row, client.config, vault, now)
++    if not row["can_renew"]:
++        raise InstagramError(
++            "A renovação pela API precisa de business_management. Use Reconectar pelo Instagram."
++        )
++    try:
++        token = client.renew(
++            account, row["business_id"], original, expiring=row["token_expires_at"] is not None
++        )
++    except InstagramError as error:
++        if error.auth:
++            store.auth_needed(account, client.config, vault, original)
++        raise
++    store.rotate_token(account, client.config, vault, original, row["business_id"], token)
+ 
+ 
+ def _retry(store: Store, row: sqlite3.Row, now: int, error: InstagramError) -> None:
+@@ -76,6 +73,7 @@
+     if row is None:
+         return False
+     account = row["account_id"]
++    token = None
+     try:
+         if not row["publish_started"] and now > row["scheduled_at"] + GRACE_SECONDS:
+             store.finish(
+@@ -83,10 +81,7 @@
+             )
+             return True
+         current = store.account(account)
+-        credentials = vault.get(account) if current["connected"] else None
+-        if not credentials or current["auth_needed"]:
+-            raise InstagramError("Reconecte a conta de destino na página do Instagram.")
+-        token = credentials.page
++        token = require_token(current, client.config, vault, now)
+ 
+         if not row["container_id"]:
+             path = store.media(row["id"])
+@@ -153,20 +148,12 @@
+             )
+     except InstagramError as error:
+         now = int(clock())
+-        if error.auth and not row["refreshed"]:
+-            row = store.checkpoint(row, now, refreshed=1)
+-            try:
+-                refresh_credentials(store, vault, client, account, now)
+-                store.finish(
+-                    row, now, "retry", "Acesso à Página renovado.", next_at=now + POLL_SECONDS
+-                )
+-                return True
+-            except InstagramError as refresh_error:
+-                if refresh_error.retry:
+-                    store.checkpoint(row, now, refreshed=0)
+-                error = refresh_error
+         if error.auth:
+-            store.auth_needed(account)
++            if token:
++                store.auth_needed(account, client.config, vault, token)
++            detail = str(error) + " Reconecte a conta de destino."
++            _retry(store, row, now, InstagramError(detail))
++            return True
+         # Ambiguous publish failures get a status check before manual review.
+         if (
+             row["publish_started"]
+diff --git a/frontend/src/instagram.ts b/frontend/src/instagram.ts
+--- a/frontend/src/instagram.ts
++++ b/frontend/src/instagram.ts
+@@ -10,13 +10,12 @@
+ export interface AccountOption {
+   id: string
+   username: string
+-  page_name: string
+ }
+ 
+ export interface InstagramAccount extends AccountOption {
+-  connected: number
+-  auth_needed: number
+-  user_expires_at: number | null
++  authorization: 'connected' | 'expired' | 'reconnect' | 'unavailable' | 'disconnected'
++  expires_at: number | null
++  can_renew: boolean
+ }
+ 
+ export interface ReelExport {
+@@ -83,7 +82,8 @@
+   status: () => read<InstagramStatus>('/status'),
+   accounts: () => read<InstagramAccount[]>('/accounts'),
+   exports: (preferred: string) => read<ReelExport[]>(`/exports?preferred=${encodeURIComponent(preferred)}`),
+-  startLogin: () => write<{ url: string }>('/oauth/start', 'POST'),
++  startLogin: (accountId?: string) =>
++    write<{ url: string }>('/oauth/start', 'POST', { account_id: accountId }),
+   loginAccounts: () => read<AccountOption[]>('/oauth/accounts'),
+   linkAccounts: (ids: string[]) => write<void>('/oauth/accounts', 'POST', { ids }),
+   renew: (id: string) => write<void>(`/accounts/${id}/renew`, 'POST'),
+diff --git a/frontend/src/pages/Instagram.tsx b/frontend/src/pages/Instagram.tsx
+--- a/frontend/src/pages/Instagram.tsx
++++ b/frontend/src/pages/Instagram.tsx
+@@ -15,8 +15,17 @@
+   sessao: 'A sessão expirou. Inicie a conexão novamente.',
+   rede: 'A Meta não respondeu. Confira a conexão e tente novamente.',
+   acesso: 'A Meta não validou o acesso. Inicie a conexão novamente.',
+-  permissoes: 'A Meta recusou o acesso. Confira as permissões e as Páginas selecionadas.',
+-  'sem-contas': 'Nenhuma conta profissional vinculada a uma Página com acesso para publicar.',
++  permissoes: 'A Meta recusou o acesso. Confira as permissões e o portfólio empresarial.',
++  'sem-contas': 'Nenhuma conta profissional foi compartilhada. Selecione a conta no portfólio empresarial durante o login.',
++  'outra-conta': 'O login não autorizou a conta que você escolheu reconectar. Entre no Instagram com essa conta e tente novamente.',
++}
++
++const AUTHORIZATION = {
++  connected: 'Autorizada',
++  expired: 'Acesso expirado',
++  reconnect: 'Reconexão necessária',
++  unavailable: 'Acesso indisponível',
++  disconnected: 'Desconectada',
+ }
+ 
+ const date = (seconds: number | null) => seconds === null ? '—' :
+@@ -98,13 +107,18 @@
+       await refresh()
+     } catch (err) {
+       setError(err as Error)
++      await refresh().catch(() => undefined)
+     } finally {
+       setBusy(false)
+     }
+   }
+ 
+-  const linked = accounts.filter((account) => account.connected)
+-  const usable = linked.filter((account) => !account.auth_needed)
++  const linked = accounts.filter((account) => account.authorization !== 'disconnected')
++  const usable = linked.filter((account) => account.authorization === 'connected')
++  const login = (accountId?: string) => void perform(async () => {
++    const { url } = await instagram.startLogin(accountId)
++    window.location.assign(url)
++  })
+   const accountName = (id: string | null) => {
+     const account = accounts.find((item) => item.id === id)
+     return account ? `@${account.username}` : 'Conta a escolher'
+@@ -164,9 +178,9 @@
+             ) : (
+               <button
+                 type="button" className="btn btn-primary" disabled={busy || !status?.configured}
+-                onClick={() => void perform(async () => { window.location.assign((await instagram.startLogin()).url) })}
++                onClick={() => login()}
+               >
+-                Conectar pela Meta
++                Conectar Instagram
+               </button>
+             )}
+           </div>
+@@ -181,6 +195,11 @@
+           )}
+           {status?.configured && !status.publishing_enabled && (
+             <p className="mt-4 text-sm text-ink-500">A fila está pausada neste computador. Revise e aprove os rascunhos antes de ativar o envio.</p>
++          )}
++          {status?.configured && (
++            <p className="mt-3 text-xs text-ink-500">
++              Escolha o login do Instagram na Meta e autorize o acesso à conta profissional no portfólio empresarial.
++            </p>
+           )}
+           {outcome === 'selecionar' && (
+             <AccountPicker
+@@ -201,20 +220,28 @@
+               {accounts.map((account) => (
+                 <li key={account.id} className="rounded-lg border border-ink-800 p-4 text-sm">
+                   <p className="break-words font-semibold">@{account.username}</p>
+-                  <p className="mt-1 break-words text-xs text-ink-500">{account.page_name}</p>
+                   <p className="mt-2 text-xs font-medium">
+-                    {!account.connected ? 'Desconectada' : account.auth_needed ? 'Reconexão necessária' : 'Conectada'}
++                    {AUTHORIZATION[account.authorization]}
+                   </p>
+-                  {!!account.connected && !account.auth_needed && account.user_expires_at !== null && (
+-                    <p className="mt-1 text-xs text-ink-500">Acesso de usuário até {date(account.user_expires_at)}</p>
++                  {account.authorization === 'connected' && (
++                    <p className="mt-1 text-xs text-ink-500">
++                      {account.expires_at ? `Válido até ${date(account.expires_at)}` : 'Sem vencimento informado'}
++                    </p>
+                   )}
+-                  {!!account.connected && (
+-                    <div className="mt-3 flex flex-wrap gap-2">
++                  <div className="mt-3 flex flex-wrap gap-2">
++                    {account.can_renew && (
+                       <button className="btn btn-ghost" disabled={busy || !status?.configured}
+-                        onClick={() => void perform(() => instagram.renew(account.id), 'Acesso à Página renovado.')}>
++                        onClick={() => void perform(() => instagram.renew(account.id), 'Acesso ao Instagram renovado.')}>
+                         Renovar acesso
+                       </button>
+-                      <button className="btn btn-quiet" disabled={busy || !status?.configured}
++                    )}
++                    <button className="btn btn-ghost"
++                      disabled={busy || !status?.configured || status.login_origin !== window.location.origin}
++                      onClick={() => login(account.id)}>
++                      Reconectar pelo Instagram
++                    </button>
++                    {account.authorization !== 'disconnected' && (
++                      <button className="btn btn-quiet" disabled={busy}
+                         onClick={() => {
+                           if (window.confirm(`Desconectar @${account.username} e retirar da fila os Reels pendentes desta conta?`)) {
+                             void perform(() => instagram.disconnect(account.id), 'Conta desconectada.')
+@@ -222,8 +249,8 @@
+                         }}>
+                         Desconectar
+                       </button>
+-                    </div>
+-                  )}
++                    )}
++                  </div>
+                 </li>
+               ))}
+             </ul>
+@@ -358,7 +385,11 @@
+ }) {
+   const [selected, setSelected] = useState<string[]>([])
+   const capacity = new Set([...linked.map(({ id }) => id), ...selected]).size
+-  if (!choices.length) return null
++  if (!choices.length) return (
++    <p className="mt-4 text-sm text-ink-500">
++      Se as contas não aparecerem, use Conectar Instagram para iniciar uma nova sessão.
++    </p>
++  )
+   return (
+     <fieldset className="mt-4 rounded-lg border border-ink-800 p-4">
+       <legend className="px-2 text-sm font-semibold">Escolha as contas autorizadas na Meta</legend>
+@@ -370,7 +401,7 @@
+               <label className="flex items-center gap-2 text-sm">
+                 <input type="checkbox" className="accent-sodium-500" checked={on} disabled={busy || (!on && capacity >= 2 && !linked.some((item) => item.id === choice.id))}
+                   onChange={(e) => setSelected(e.target.checked ? [...selected, choice.id] : selected.filter((id) => id !== choice.id))} />
+-                <span>@{choice.username} <span className="text-ink-500">· {choice.page_name}</span></span>
++                <span>@{choice.username}</span>
+               </label>
+             </li>
+           )
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -31,6 +31,7 @@
+   "uvicorn[standard]>=0.32",
+   "sse-starlette>=2.1",
+   "python-multipart>=0.0.9",
++  "cryptography>=43",
+   # Models / config
+   "pydantic>=2.9",
+   "pydantic-settings>=2.5",
+diff --git a/tests/test_studio_instagram.py b/tests/test_studio_instagram.py
+--- a/tests/test_studio_instagram.py
++++ b/tests/test_studio_instagram.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import logging
++import sqlite3
++import ssl
+ import time
+ from contextlib import contextmanager
+ from datetime import UTC, datetime
+@@ -18,27 +20,38 @@
+ from autoclip.instagram import worker
+ from autoclip.instagram.media import sha256
+ from autoclip.instagram.meta import (
+-    PERMISSIONS,
++    DEFAULT_REDIRECT,
++    PUBLISH_SCOPES,
++    RENEW_SCOPE,
+     AccountGrant,
++    Authorization,
+     InstagramError,
+     MetaClient,
+     MetaConfig,
+-    UserToken,
++    SystemToken,
+ )
+-from autoclip.instagram.store import Credentials, Store, StoreConflict, Vault, local_store
++from autoclip.instagram.store import SCHEMA, Store, StoreConflict, Vault, local_store
++from autoclip.instagram.tls import SERVER_CERT, prepare_certificate
+ from autoclip.pipeline import ffmpeg
++from cryptography import x509
+ from fastapi.testclient import TestClient
+ 
+-ORIGIN = "http://localhost:8000"
++ORIGIN = "https://localhost:8000"
+ PREFIX = "/api/instagram"
+ HEADERS = {"Origin": ORIGIN, "X-Studio-Local": "1"}
+ EPOCH = 1_700_000_000
+ GRANTS = [
+-    AccountGrant("101", "201", "canal_a", "Página A", "page-secret-a"),
+-    AccountGrant("102", "202", "canal_b", "Página B", "page-secret-b"),
+-    AccountGrant("103", "203", "canal_c", "Página C", "page-secret-c"),
++    AccountGrant("101", "canal_a"),
++    AccountGrant("102", "canal_b"),
++    AccountGrant("103", "canal_c"),
+ ]
+-USER = UserToken("long-user-secret", EPOCH + 600)
++CONFIG = MetaConfig("111", "222", "application-secret")
++TOKEN = SystemToken("suat-fixture-a", None, True)
++
++
++def link(store: Store, vault: Vault, grants=None, token=TOKEN, config=CONFIG, now=EPOCH):
++    grants = GRANTS[:2] if grants is None else grants
++    store.connect_accounts(grants, Authorization("201", token, grants), config, vault, now)
+ 
+ 
+ def edits(account: str = "101", scheduled: int = EPOCH + 1) -> dict:
+@@ -73,93 +86,108 @@
+         "AI_SHORTS_META_APP_SECRET": "application-secret",
+         "AI_SHORTS_META_API_VERSION": "v27.0",
+         "AI_SHORTS_META_REDIRECT_URI": ORIGIN + PREFIX + "/oauth/callback",
+-        "AI_SHORTS_INSTAGRAM_PUBLISH": "1",
+         "AUTOCLIP_NO_WORKER": "1",
+     }.items():
+         monkeypatch.setenv(key, value)
++    monkeypatch.delenv("AI_SHORTS_INSTAGRAM_PUBLISH", raising=False)
+     with TestClient(
+         create_app(), base_url=ORIGIN, client=("127.0.0.1", 50000), follow_redirects=False
+     ) as test_client:
+         yield test_client
+ 
+ 
+-def test_oauth_code_and_scopes_are_server_side(client, monkeypatch, vault, caplog):
+-    calls = []
+-
+-    def response(request: httpx.Request) -> httpx.Response:
+-        calls.append(request)
+-        assert request.url.host == "graph.facebook.com"
+-        endpoint = request.url.path
+-        if endpoint.endswith("/oauth/access_token"):
+-            assert request.url.params["client_secret"] == "application-secret"
+-            if request.url.params.get("grant_type"):
+-                assert request.url.params["fb_exchange_token"] == "short-user-secret"
+-                return httpx.Response(200, json={"access_token": USER.value, "expires_in": 500})
+-            assert request.url.params["code"] == "fake-callback-code"
+-            assert request.url.params["redirect_uri"] == ORIGIN + PREFIX + "/oauth/callback"
+-            return httpx.Response(200, json={"access_token": "short-user-secret"})
+-        assert request.headers["authorization"] == f"Bearer {USER.value}"
+-        assert request.url.params["appsecret_proof"]
+-        if endpoint.endswith("/me/permissions"):
+-            return httpx.Response(
+-                200,
+-                json={
+-                    "data": [
+-                        {"permission": permission, "status": "granted"}
+-                        for permission in PERMISSIONS
+-                    ]
+-                },
+-            )
+-        assert endpoint.endswith("/me/accounts")
+-        return httpx.Response(
+-            200,
+-            json={
+-                "data": [
+-                    {
+-                        "id": account.page_id,
+-                        "access_token": account.page_token,
+-                        "name": account.page_name,
+-                        "tasks": ["CREATE_CONTENT"],
+-                        "instagram_business_account": {
+-                            "id": account.id,
+-                            "username": account.username,
+-                        },
+-                    }
+-                    for account in GRANTS
+-                ]
+-            },
+-        )
+-
++def mock_meta(monkeypatch, response):
+     @contextmanager
+     def http():
+         with httpx.Client(transport=httpx.MockTransport(response)) as mocked:
+             yield mocked
+ 
+     monkeypatch.setattr(routes, "http_client", http)
++
++
++def grant_response(request, token, grants, *, scopes=None, expires=0, business="201"):
++    assert request.url.host == "graph.facebook.com"
++    assert request.url.params["appsecret_proof"]
++    if request.url.path.endswith("/debug_token"):
++        assert request.url.params["input_token"] == token
++        assert request.headers["authorization"] == "Bearer 111|application-secret"
++        return httpx.Response(
++            200,
++            json={
++                "data": {
++                    "app_id": CONFIG.app_id,
++                    "is_valid": True,
++                    "expires_at": expires,
++                    "scopes": sorted(PUBLISH_SCOPES | {RENEW_SCOPE} if scopes is None else scopes),
++                }
++            },
++        )
++    assert request.headers["authorization"] == f"Bearer {token}"
++    if request.url.path.endswith("/me"):
++        assert request.url.params["fields"] == "client_business_id"
++        return httpx.Response(200, json={"client_business_id": business, "id": "800"})
++    assert request.url.path.endswith("/me/assigned_instagram_accounts")
++    assert request.url.params["fields"] == "id,username"
++    return httpx.Response(
++        200, json={"data": [{"id": account.id, "username": account.username} for account in grants]}
++    )
++
++
++def start_login(client, account=None):
++    response = client.post(PREFIX + "/oauth/start", headers=HEADERS, json={"account_id": account})
++    assert response.status_code == 200, response.text
++    return response, parse_qs(urlsplit(response.json()["url"]).query)
++
++
++def test_unified_oauth_and_scopes_are_server_side(client, monkeypatch, vault, caplog):
++    calls = []
++
++    def response(request: httpx.Request) -> httpx.Response:
++        calls.append(request.url.path)
++        if request.url.path.endswith("/oauth/access_token"):
++            assert request.url.host == "graph.facebook.com"
++            assert dict(request.url.params) == {
++                "client_id": "111",
++                "client_secret": "application-secret",
++                "code": "fake-code",
++            }
++            return httpx.Response(200, json={"access_token": TOKEN.value})
++        return grant_response(request, TOKEN.value, GRANTS)
++
++    mock_meta(monkeypatch, response)
+     caplog.set_level(logging.INFO, logger="httpx")
+     assert client.post(PREFIX + "/oauth/start").status_code == 403
+     invalid = client.get(PREFIX + "/oauth/callback?state=invalid&code=bad")
+     assert invalid.headers["location"].endswith("conexao=sessao")
+     assert calls == []
+ 
+-    url = client.post(PREFIX + "/oauth/start", headers=HEADERS)
++    url, query = start_login(client)
+     assert "HttpOnly" in url.headers["Set-Cookie"]
++    assert "Secure" in url.headers["Set-Cookie"]
+     oauth = urlsplit(url.json()["url"])
+-    query = parse_qs(oauth.query)
+     assert oauth.hostname == "www.facebook.com"
++    assert oauth.path == "/dialog/oauth"
+     assert query["config_id"] == ["222"]
+     assert query["response_type"] == ["code"]
++    assert query["redirect_uri"] == [DEFAULT_REDIRECT]
++    assert query["prompt"] == ["login"]
+     assert "client_secret" not in query
+ 
+-    params = {"state": query["state"][0], "code": "fake-callback-code"}
++    params = {"state": query["state"][0], "code": "fake-code"}
+     callback = client.get(PREFIX + "/oauth/callback", params=params)
+     assert callback.headers["location"].endswith("conexao=selecionar")
+     assert callback.headers["referrer-policy"] == "no-referrer"
+     second = client.get(PREFIX + "/oauth/callback", params=params)
+     assert second.headers["location"].endswith("conexao=sessao")
+-    assert len(calls) == 4
++    assert calls == [
++        "/v27.0/oauth/access_token",
++        "/v27.0/me",
++        "/v27.0/debug_token",
++        "/v27.0/me/assigned_instagram_accounts",
++    ]
+     assert "application-secret" not in caplog.text
+-    assert "fake-callback-code" not in caplog.text
++    assert "fake-code" not in caplog.text
++    assert TOKEN.value not in caplog.text
+     assert len(client.get(PREFIX + "/oauth/accounts").json()) == 3
+     assert (
+         client.post(PREFIX + "/oauth/accounts", headers=HEADERS, json={"ids": ["999"]}).status_code
+@@ -171,14 +199,200 @@
+     assert selection.status_code == 204
+     saved = client.get(PREFIX + "/accounts")
+     assert [item["id"] for item in saved.json()] == ["101", "102"]
+-    assert "secret" not in saved.text
+-    assert vault.get("101") == Credentials("page-secret-a", USER.value)
+-    assert vault.get("102").page == "page-secret-b"
++    assert saved.json()[0]["authorization"] == "connected"
++    assert saved.json()[0]["can_renew"] is True
++    assert "business_id" not in saved.text
++    assert TOKEN.value not in saved.text
++    assert vault.get("101") == TOKEN.value
++    assert vault.get("102") == TOKEN.value
+     assert vault.get("103") is None
+     assert client.get(PREFIX + "/oauth/accounts").json() == []
+     with local_store().connect() as conn:
+-        assert "secret" not in "\n".join(conn.iterdump())
++        assert TOKEN.value not in "\n".join(conn.iterdump())
++        binding = conn.execute("SELECT * FROM accounts WHERE id='101'").fetchone()
++        assert binding["meta_config_id"] == "222"
++        assert binding["business_id"] == "201"
+     assert client.get(PREFIX + "/status").json()["publishing_enabled"] is False
++
++
++def test_http_callback_is_rejected_for_unified_login(client, monkeypatch):
++    monkeypatch.setenv("AI_SHORTS_META_REDIRECT_URI", DEFAULT_REDIRECT.replace("https:", "http:"))
++    status = client.get(PREFIX + "/status").json()
++    assert status["configured"] is False
++    assert "HTTPS" in status["problem"]
++    start = client.post(PREFIX + "/oauth/start", headers=HEADERS, json={})
++    assert start.status_code == 503
++    assert "HTTPS" in start.json()["detail"]
++
++
++def test_expired_state_does_not_exchange_the_code(client, monkeypatch):
++    def not_called(_request):
++        pytest.fail("The expired state must be rejected before contacting Meta")
++
++    mock_meta(monkeypatch, not_called)
++    _, query = start_login(client)
++    nonce = query["state"][0]
++    with local_store().connect(write=True) as conn:
++        conn.execute("UPDATE oauth_states SET expires=0")
++    callback = client.get(PREFIX + "/oauth/callback", params={"state": nonce, "code": "unused"})
++    assert callback.headers["location"].endswith("conexao=sessao")
++
++
++def test_reconnection_offers_only_the_requested_instagram_account(client, monkeypatch, vault):
++    store = local_store()
++    link(store, vault)
++    shared = GRANTS[1:2]
++    new_token = "suat-fixture-new"
++
++    def response(request):
++        if request.url.path.endswith("/oauth/access_token"):
++            return httpx.Response(200, json={"access_token": new_token})
++        return grant_response(request, new_token, shared)
++
++    mock_meta(monkeypatch, response)
++    _, query = start_login(client, "101")
++    callback = client.get(
++        PREFIX + "/oauth/callback",
++        params={
++            "state": query["state"][0],
++            "code": "other-account",
++        },
++    )
++    assert callback.headers["location"].endswith("conexao=outra-conta")
++    assert client.get(PREFIX + "/oauth/accounts").json() == []
++    assert vault.get("101") == vault.get("102") == TOKEN.value
++
++    shared = GRANTS[:2]
++    _, query = start_login(client, "101")
++    callback = client.get(
++        PREFIX + "/oauth/callback",
++        params={
++            "state": query["state"][0],
++            "code": "correct-account",
++        },
++    )
++    assert callback.headers["location"].endswith("conexao=selecionar")
++    assert client.get(PREFIX + "/oauth/accounts").json() == [{"id": "101", "username": "canal_a"}]
++    selection = client.post(PREFIX + "/oauth/accounts", headers=HEADERS, json={"ids": ["101"]})
++    assert selection.status_code == 204
++    assert vault.get("101") == new_token
++    assert vault.get("102") == TOKEN.value
++
++
++def test_missing_publish_scope_is_rejected_before_connection(client, monkeypatch):
++    def response(request):
++        if request.url.path.endswith("/oauth/access_token"):
++            return httpx.Response(200, json={"access_token": TOKEN.value})
++        assert not request.url.path.endswith("/assigned_instagram_accounts")
++        return grant_response(request, TOKEN.value, GRANTS, scopes={"instagram_basic"})
++
++    mock_meta(monkeypatch, response)
++    _, query = start_login(client)
++    callback = client.get(
++        PREFIX + "/oauth/callback",
++        params={
++            "state": query["state"][0],
++            "code": "missing-scope",
++        },
++    )
++    assert callback.headers["location"].endswith("conexao=permissoes")
++    assert client.get(PREFIX + "/accounts").json() == []
++
++
++def test_renewal_generates_a_token_for_only_the_selected_account(client, monkeypatch, vault):
++    store = local_store()
++    expires = int(time.time()) + 3600
++    link(store, vault, token=SystemToken(TOKEN.value, expires, True))
++    updated_expiry = expires + 86400
++    new_token = "suat-fixture-renewed"
++
++    def response(request):
++        if request.url.path.endswith("/201/system_user_access_tokens"):
++            assert request.method == "POST"
++            assert request.headers["authorization"] == f"Bearer {TOKEN.value}"
++            assert request.url.params["appsecret_proof"]
++            form = parse_qs(request.content.decode())
++            assert form["asset"] == ["101"]
++            assert set(form["scope"][0].split(",")) == PUBLISH_SCOPES | {RENEW_SCOPE}
++            assert form["set_token_expires_in_60_days"] == ["true"]
++            assert form["fetch_only"] == ["false"]
++            return httpx.Response(200, json={"access_token": new_token})
++        return grant_response(request, new_token, GRANTS[:1], expires=updated_expiry)
++
++    mock_meta(monkeypatch, response)
++    assert client.post(PREFIX + "/accounts/101/renew", headers=HEADERS).status_code == 204
++    assert vault.get("101") == new_token
++    assert vault.get("102") == TOKEN.value
++    assert store.account("101")["token_expires_at"] == updated_expiry
++    assert store.account("102")["token_expires_at"] == expires
++
++
++def test_expiration_and_missing_renew_permission_are_visible(client, monkeypatch, vault):
++    store = local_store()
++    link(store, vault, GRANTS[:1], SystemToken(TOKEN.value, EPOCH + 1, True))
++    link(store, vault, GRANTS[1:2], SystemToken("suat-fixture-b", None, False))
++
++    def not_called(_request):
++        pytest.fail("Renewal requires a valid token with business_management")
++
++    mock_meta(monkeypatch, not_called)
++    rows = client.get(PREFIX + "/accounts").json()
++    assert [row["authorization"] for row in rows] == ["expired", "connected"]
++    assert not any(row["can_renew"] for row in rows)
++    for account, message in [("101", "expirou"), ("102", "business_management")]:
++        renewal = client.post(f"{PREFIX}/accounts/{account}/renew", headers=HEADERS)
++        assert renewal.status_code == 422
++        assert message in renewal.json()["detail"]
++    assert vault.get("102") == "suat-fixture-b"
++
++
++def test_upgrade_preserves_existing_schedule_and_history(client, vault):
++    home = paths.root()
++    with sqlite3.connect(home / "publicacoes.sqlite3") as conn:
++        conn.executescript("""
++            CREATE TABLE oauth_states (digest TEXT PRIMARY KEY, expires INTEGER NOT NULL);
++        """)
++        conn.executescript(SCHEMA)
++        conn.execute("INSERT INTO accounts VALUES ('101','301','canal_a','Página',1,0,NULL)")
++        conn.execute(
++            """INSERT INTO reels (
++                id, export_id, title, sha256, account_id, caption, scheduled_at, approved_at,
++                rights_confirmed, status, created_at, updated_at, next_at, container_id, uploaded
++            ) VALUES (?, ?, 'Mantido', 'hash', '101', 'Legenda existente', ?, ?, 1,
++                      'waiting', ?, ?, ?, '901', 1)""",
++            ("a" * 16, "b" * 16, EPOCH + 120, EPOCH, EPOCH, EPOCH, EPOCH + 120),
++        )
++        conn.execute(
++            "INSERT INTO events (reel_id, at, status, detail) VALUES (?, ?, 'queued', 'Aprovado')",
++            ("a" * 16, EPOCH),
++        )
++    assert client.get(PREFIX + "/accounts").json()[0]["authorization"] == "reconnect"
++    store = local_store()
++    link(store, vault, GRANTS[:1])
++    reel = store.reel("a" * 16)
++    assert reel["scheduled_at"] == EPOCH + 120
++    assert reel["approved_at"] == EPOCH
++    assert reel["caption"] == "Legenda existente"
++    assert reel["container_id"] is None
++    assert store.events(reel["id"])[0]["detail"] == "Aprovado"
++    assert "account_id" in dicts_columns(store, "oauth_states")
++
++
++def dicts_columns(store, table):
++    with store.connect() as conn:
++        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
++
++
++def test_local_certificate_matches_its_private_key_and_is_not_a_ca(tmp_path):
++    public, digest = prepare_certificate(tmp_path)
++    assert prepare_certificate(tmp_path) == (public, digest)
++    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    context.load_cert_chain(tmp_path / SERVER_CERT)
++    certificate = x509.load_der_x509_certificate(public.read_bytes())
++    assert certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca is False
++    san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
++    assert san.get_values_for_type(x509.DNSName) == ["localhost"]
++    assert prepare_certificate(tmp_path, renew=True)[1] != digest
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -198,7 +412,7 @@
+ 
+ def test_approval_is_explicit_and_queue_is_per_account(client, vault):
+     store = local_store()
+-    store.connect_accounts(GRANTS[:2], USER, vault)
++    link(store, vault)
+     first = draft(store)
+     other = draft(store)
+     scheduled = datetime.fromtimestamp(time.time() + 120, UTC).isoformat()
+@@ -243,14 +457,16 @@
+ 
+ def test_windows_vault_limit_is_enforced_without_writing_third_account(vault):
+     store = local_store()
+-    store.connect_accounts(GRANTS[:2], USER, vault)
++    link(store, vault)
+     with pytest.raises(StoreConflict, match="duas"):
+-        store.connect_accounts(GRANTS[2:], USER, vault)
++        link(store, vault, GRANTS[2:])
+     assert vault.get("103") is None
+     assert [row["id"] for row in store.accounts()] == ["101", "102"]
+ 
+ 
+ class FakeMeta:
++    config = CONFIG
++
+     def __init__(self) -> None:
+         self.created = []
+         self.sent = []
+@@ -277,17 +493,14 @@
+             raise self.publish_error
+         return "401"
+ 
+-    def grants(self, user):
+-        assert user == USER.value
+-        return [AccountGrant("101", "201", "canal_a", "Página A", "new-page-secret")]
+-
+ 
+ @pytest.fixture
+ def approved(vault):
+     store = local_store()
+-    store.connect_accounts(GRANTS[:2], USER, vault)
++    link(store, vault, GRANTS[:1])
++    link(store, vault, GRANTS[1:2], SystemToken("suat-fixture-b", None, True))
+     reel = draft(store)
+-    store.save_draft(reel, EPOCH, edits(), approve=True)
++    store.save_draft(reel, EPOCH, edits(), approval=(CONFIG, vault))
+     return store, reel, FakeMeta()
+ 
+ 
+@@ -307,7 +520,7 @@
+     assert worker.dispatch_one(store, vault, meta, lambda: waiting["next_at"])
+     assert store.reel(reel)["media_id"] == "401"
+     assert store.reel(reel)["status"] == "published"
+-    assert meta.created[-1] == ("101", "page-secret-a", "Um corte\n\n#jogos")
++    assert meta.created[-1] == ("101", TOKEN.value, "Um corte\n\n#jogos")
+     assert [row["status"] for row in store.events(reel)] == [
+         "published",
+         "waiting",
+@@ -327,7 +540,7 @@
+     restarted.reopen(reel, now)
+     assert restarted.reel(reel)["approved_at"] is None
+     assert not worker.dispatch_one(restarted, vault, meta, lambda: now)
+-    restarted.save_draft(reel, now, edits(scheduled=now + 30), approve=True)
++    restarted.save_draft(reel, now, edits(scheduled=now + 30), approval=(CONFIG, vault))
+     assert restarted.reel(reel)["status"] == "queued"
+ 
+ 
+@@ -371,15 +584,20 @@
+     assert meta.published == []
+ 
+ 
+-def test_page_token_renews_once_without_overwriting_another_account(approved, vault):
++def test_revoked_token_stops_submissions_and_leaves_other_account_usable(approved, vault):
+     store, reel, meta = approved
+-    meta.upload_error = InstagramError("Token vencido.", auth=True)
++    second = draft(store)
++    store.save_draft(second, EPOCH, edits("102", EPOCH + 2), approval=(CONFIG, vault))
++    meta.upload_error = InstagramError("Token revogado.", auth=True)
+     assert worker.dispatch_one(store, vault, meta, lambda: EPOCH + 1)
+-    assert vault.get("101").page == "new-page-secret"
+-    assert vault.get("102").page == "page-secret-b"
++    assert store.reel(reel)["status"] == "failed"
++    assert store.account("101")["auth_needed"] == 1
++    assert store.account("102")["auth_needed"] == 0
+     meta.upload_error = None
+-    assert worker.dispatch_one(store, vault, meta, lambda: store.reel(reel)["next_at"])
+-    assert meta.created[-1][1] == "new-page-secret"
++    assert worker.dispatch_one(store, vault, meta, lambda: EPOCH + 2)
++    assert worker.dispatch_one(store, vault, meta, lambda: store.reel(second)["next_at"])
++    assert meta.published == [("102", "301", "suat-fixture-b")]
++    assert store.reel(second)["status"] == "published"
+ 
+ 
+ def test_changed_snapshot_fails_before_sending(approved, vault):

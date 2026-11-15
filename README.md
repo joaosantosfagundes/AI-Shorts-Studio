@@ -2,7 +2,7 @@
 
 O painel abre em tema claro e usa português brasileiro. Use **Tema escuro** para alternar. A preferência é salva no navegador. O Clipador continua usando o AutoClip para analisar, editar e exportar os cortes.
 
-Em **Instagram**, prepare um Reel a partir de um MP4 vertical exportado. A integração oferece até duas contas profissionais, aprovação antes do agendamento, fila por conta e histórico. A publicação começa pausada e depende das credenciais e permissões da Meta. [Configurar o Instagram no Windows](docs/instagram-meta.md)
+Em **Instagram**, use o Unified Login da Meta para conectar até duas contas profissionais em um portfólio empresarial, sem precisar de Páginas do Facebook. Prepare Reels a partir de MP4 verticais, aprove cada envio e acompanhe a fila e o histórico por conta. A publicação começa pausada. [Configurar Unified Login e HTTPS local no Windows](docs/instagram-meta.md)
 
 **Histórias IA** tem uma página própria para o futuro fluxo de produção em cartoon 2D.
 
@@ -65,6 +65,8 @@ Inicie o Ollama e o painel no mesmo terminal. Mantenha o terminal aberto durante
 ```powershell
 .\scripts\iniciar-fase1.ps1
 ```
+
+Após mapear `localhost.localdomain` para `127.0.0.1` e preparar o certificado, o mesmo script abre o painel em `https://localhost.localdomain:8000`. O callback do Unified Login é `https://localhost.localdomain:8000/api/instagram/oauth/callback`. [Configurar o hostname e o certificado do Instagram](docs/instagram-meta.md)
 
 ### Teste funcional com vídeo curto
 

@@ -1,0 +1,614 @@
+diff --git a/backend/autoclip/instagram/api.py b/backend/autoclip/instagram/api.py
+--- a/backend/autoclip/instagram/api.py
++++ b/backend/autoclip/instagram/api.py
+@@ -11,7 +11,8 @@
+ import threading
+ import time
+ from dataclasses import dataclass, replace
+-from datetime import datetime
++from datetime import UTC, datetime
++from pathlib import Path
+ from typing import Annotated, Literal
+ from urllib.parse import urlsplit
+ 
+@@ -28,6 +29,7 @@
+     InstagramError,
+     MetaClient,
+     MetaConfig,
++    OAuthStepError,
+ )
+ from .store import StoreConflict, Vault, authorization_status, local_store, require_token
+ from .worker import http_client, refresh_credentials
+@@ -42,12 +44,20 @@
+     "Cross-Origin-Resource-Policy": "same-origin",
+ }
+ ID = re.compile(r"[0-9a-f]{16}")
+-OAUTH_TOKEN_PATHS = (CALLBACK, "/oauth/access_token", "/debug_token", "/system_user_access_tokens")
++SENSITIVE_LOG_MARKERS = (
++    CALLBACK,
++    "/oauth/access_token",
++    "/debug_token",
++    "/system_user_access_tokens",
++    "appsecret_proof=",
++)
++_oauth_log_lock = threading.Lock()
++log = logging.getLogger(__name__)
+ 
+ 
+ class SensitiveRequests(logging.Filter):
+     def filter(self, record: logging.LogRecord) -> bool:
+-        return not any(value in record.getMessage() for value in OAUTH_TOKEN_PATHS)
++        return not any(value in record.getMessage() for value in SENSITIVE_LOG_MARKERS)
+ 
+ 
+ def protect_oauth_logs() -> None:
+@@ -55,6 +65,20 @@
+         logger = logging.getLogger(name)
+         if not any(isinstance(f, SensitiveRequests) for f in logger.filters):
+             logger.addFilter(SensitiveRequests())
++
++
++def _log_oauth_failure(home: Path, diagnostic: str) -> None:
++    log.warning("Instagram Unified Login %s", diagnostic)
++    path = home / "instagram" / "oauth.log"
++    try:
++        with _oauth_log_lock:
++            path.parent.mkdir(parents=True, exist_ok=True)
++            if path.exists() and path.stat().st_size >= 256 * 1024:
++                path.replace(path.with_suffix(".log.1"))
++            with path.open("a", encoding="utf-8") as handle:
++                handle.write(f"{datetime.now(UTC).isoformat(timespec='seconds')} {diagnostic}\n")
++    except OSError:
++        log.warning("Não foi possível salvar o diagnóstico local do Instagram Unified Login.")
+ 
+ 
+ def only_local(request: Request) -> None:
+@@ -252,7 +276,8 @@
+         or not hmac.compare_digest(state, stored)
+     ):
+         return _oauth_result("sessao")
+-    login = local_store().consume_oauth(_state_key(config, state), int(time.time()))
++    store = local_store()
++    login = store.consume_oauth(_state_key(config, state), int(time.time()))
+     if login is None:
+         return _oauth_result("sessao")
+     code = request.query_params.get("code", "")
+@@ -265,13 +290,9 @@
+     try:
+         with http_client() as http:
+             authorization = MetaClient(config, http).exchange(code)
+-    except InstagramError as error:
+-        if error.retry:
+-            return _oauth_result("rede")
+-        if error.auth:
+-            return _oauth_result("acesso")
+-        logging.getLogger(__name__).warning("Retorno da Meta: %s", error)
+-        return _oauth_result("permissoes")
++    except OAuthStepError as error:
++        _log_oauth_failure(store.home, error.diagnostic)
++        return _oauth_result(error.outcome)
+     if not authorization.accounts:
+         return _oauth_result("sem-contas")
+     if target := login["account_id"]:
+diff --git a/backend/autoclip/instagram/meta.py b/backend/autoclip/instagram/meta.py
+--- a/backend/autoclip/instagram/meta.py
++++ b/backend/autoclip/instagram/meta.py
+@@ -7,6 +7,8 @@
+ import os
+ import re
+ import time
++from collections.abc import Iterator
++from contextlib import contextmanager
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from urllib.parse import urlencode, urlsplit
+@@ -20,6 +22,12 @@
+ LOOPBACK_HOSTS = LOOPBACK_ADDRESSES | {"localhost", STUDIO_HOST}
+ PUBLISH_SCOPES = {"instagram_basic", "instagram_content_publish"}
+ RENEW_SCOPE = "business_management"
++OAUTH_PHASES = {
++    "oauth/access_token": "troca-codigo",
++    "me": "portfolio",
++    "debug_token": "inspecao-token",
++    "me/assigned_instagram_accounts": "contas",
++}
+ 
+ 
+ class InstagramError(RuntimeError):
+@@ -29,6 +37,22 @@
+         super().__init__(message)
+         self.retry = retry
+         self.auth = auth
++
++
++class MetaRequestError(InstagramError):
++    def __init__(
++        self, message: str, diagnostic: str, *, retry: bool = False, auth: bool = False
++    ) -> None:
++        super().__init__(message, retry=retry, auth=auth)
++        self.diagnostic = diagnostic
++
++
++class OAuthStepError(InstagramError):
++    def __init__(self, endpoint: str, phase: str, error: InstagramError) -> None:
++        super().__init__(str(error), retry=error.retry, auth=error.auth)
++        self.outcome = "rede" if error.retry else "acesso" if error.auth else phase
++        detail = error.diagnostic if isinstance(error, MetaRequestError) else str(error)
++        self.diagnostic = f"etapa={phase} endpoint={endpoint} {detail}"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -123,51 +147,129 @@
+     return isinstance(value, str) and bool(re.fullmatch(r"[0-9]{1,32}", value))
+ 
+ 
++def _safe_meta_message(error: dict, code: int | None, subcode: int | None, fallback: str) -> str:
++    # Meta may echo request parameters and identifiers in the error text.
++    # Classify the reason and emit only messages defined here.
++    raw = error.get("message")
++    message = raw[:2048].lower() if isinstance(raw, str) else ""
++    if "redirect_uri" in message and any(
++        word in message for word in ("same", "match", "identical", "missing", "required", "invalid")
++    ):
++        return "A Meta rejeitou a Redirect URI na validação do código."
++    if "verification code" in message or "authorization code" in message:
++        return "A Meta rejeitou o código de autorização. Inicie um novo login."
++    if "appsecret_proof" in message:
++        return "A Meta rejeitou a prova de autenticação do aplicativo."
++    if "client_secret" in message or "app secret" in message:
++        return "A Meta indicou um problema com o segredo do aplicativo."
++    if "input_token" in message:
++        return "A Meta rejeitou o token enviado para inspeção."
++    if code == 100 and (subcode == 33 or "unsupported get request" in message):
++        return "A Meta recusou a leitura do recurso. Confira o acesso concedido ao aplicativo."
++    if code == 100:
++        return "A Meta rejeitou um parâmetro da solicitação."
++    return fallback
++
++
++def _graph_error(status: int, error: object, private: tuple[str, ...]) -> MetaRequestError:
++    error = error if isinstance(error, dict) else {}
++    code = error.get("code")
++    code = code if type(code) is int else None
++    subcode = error.get("error_subcode", error.get("subcode"))
++    subcode = subcode if type(subcode) is int else None
++    trace = error.get("fbtrace_id")
++    detail = f" Código {code}." if code is not None else ""
++    diagnostic = [f"http={status}"]
++    if code is not None:
++        diagnostic.append(f"codigo={code}")
++    if subcode is not None:
++        diagnostic.append(f"subcodigo={subcode}")
++    if (
++        isinstance(trace, str)
++        and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", trace)
++        and not any(value and value in trace for value in private)
++    ):
++        detail += f" Referência {trace}."
++        diagnostic.append(f"referencia={trace}")
++    auth = status == 401 or code in {102, 190}
++    retry = not auth and (
++        status == 429
++        or status >= 500
++        or error.get("is_transient") is True
++        or code in {1, 2, 4, 17, 32, 613, 80000}
++    )
++    if auth:
++        message = "O acesso à Meta expirou ou foi revogado."
++    elif retry:
++        message = "A Meta está indisponível ou limitou as requisições."
++    elif code in {10, 200} or status == 403:
++        message = "A Meta recusou as permissões. Confira a conta e o portfólio empresarial."
++    else:
++        message = "A Meta recusou a solicitação."
++    diagnostic.append(f"mensagem={_safe_meta_message(error, code, subcode, message)}")
++    return MetaRequestError(message + detail, " ".join(diagnostic), retry=retry, auth=auth)
++
++
++def _transport_error(error: Exception) -> MetaRequestError:
++    message = "Sem resposta da Meta. Verifique a conexão."
++    cause: BaseException | None = error
++    while cause is not None:
++        if isinstance(cause, OSError) and getattr(cause, "winerror", None) == 10054:
++            return MetaRequestError(
++                message, "transporte=WinError-10054 Conexão com a Meta encerrada.", retry=True
++            )
++        cause = cause.__cause__
++    if isinstance(error, (httpx.TimeoutException, TimeoutError)):
++        return MetaRequestError(
++            message, "transporte=timeout A Meta não respondeu a tempo.", retry=True
++        )
++    return MetaRequestError(
++        message, "transporte=sem-resposta Erro de conexão com a Meta.", retry=True
++    )
++
++
+ class MetaClient:
+     def __init__(self, config: MetaConfig, http: httpx.Client) -> None:
+         self.config = config
+         self.http = http
+ 
+-    def _request(self, method: str, url: str, **kwargs: object) -> dict:
++    def _request(
++        self, method: str, url: str, *, private: tuple[str, ...] = (), **kwargs: object
++    ) -> dict:
+         try:
+             response = self.http.request(method, url, **kwargs)
++        except (httpx.RequestError, TimeoutError) as error:
++            raise _transport_error(error) from None
++
++        status = response.status_code
++        try:
+             body = response.json()
+-        except (httpx.RequestError, TimeoutError):
+-            raise InstagramError("Sem resposta da Meta. Verifique a conexão.", retry=True) from None
+         except ValueError:
+-            raise InstagramError(
++            raise MetaRequestError(
+                 "A Meta retornou uma resposta inesperada.",
+-                retry=response.status_code == 429 or response.status_code >= 500,
++                f"http={status} Resposta sem JSON.",
++                retry=status == 429 or status >= 500,
+             ) from None
+         if not isinstance(body, dict):
+-            raise InstagramError("A Meta retornou um formato inesperado.")
++            raise MetaRequestError(
++                "A Meta retornou um formato inesperado.", f"http={status} Objeto JSON esperado."
++            )
++        error = body.get("error")
+         if response.is_success and "error" not in body:
+-            return body
+-
+-        error = body.get("error")
+-        error = error if isinstance(error, dict) else {}
+-        code = error.get("code")
+-        code = code if isinstance(code, int) else None
+-        trace = error.get("fbtrace_id")
+-        detail = f" Código {code}." if code is not None else ""
+-        if isinstance(trace, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", trace):
+-            detail += f" Referência {trace}."
+-        if response.status_code == 401 or code in {102, 190}:
+-            raise InstagramError("O acesso à Meta expirou ou foi revogado." + detail, auth=True)
+-        if (
+-            response.status_code == 429
+-            or response.status_code >= 500
+-            or error.get("is_transient") is True
+-            or code in {1, 2, 4, 17, 32, 613, 80000}
+-        ):
+-            raise InstagramError(
+-                "A Meta está indisponível ou limitou as requisições." + detail, retry=True
+-            )
+-        if code in {10, 200} or response.status_code == 403:
+-            raise InstagramError(
+-                "A Meta recusou as permissões. Confira a conta e o portfólio empresarial." + detail
+-            )
+-        raise InstagramError("A Meta recusou a solicitação." + detail)
++            # /debug_token can report rejection in data.error with HTTP 200.
++            data = body.get("data")
++            if not (url.endswith("/debug_token") and isinstance(data, dict) and data.get("error")):
++                return body
++            error = data["error"]
++        raise _graph_error(status, error, private)
++
++    @contextmanager
++    def _oauth_step(self, path: str) -> Iterator[None]:
++        try:
++            yield
++        except InstagramError as error:
++            endpoint = f"GET graph.facebook.com/{self.config.version}/{path}"
++            raise OAuthStepError(endpoint, OAUTH_PHASES[path], error) from None
+ 
+     def _graph(
+         self,
+@@ -187,49 +289,61 @@
+         return self._request(
+             method,
+             f"https://graph.facebook.com/{self.config.version}/{path}",
++            private=(
++                self.config.secret,
++                token or "",
++                query.get("code", ""),
++                query.get("input_token", ""),
++                query.get("appsecret_proof", ""),
++            ),
+             headers=headers,
+             params=query,
+             data=data,
+         )
+ 
+     def exchange(self, code: str) -> Authorization:
+-        result = self._graph(
+-            "GET",
+-            "oauth/access_token",
+-            params={
+-                "client_id": self.config.app_id,
+-                "client_secret": self.config.secret,
+-                "code": code,
+-            },
+-        )
+-        return self._authorization(result)
++        with self._oauth_step("oauth/access_token"):
++            result = self._graph(
++                "GET",
++                "oauth/access_token",
++                params={
++                    "client_id": self.config.app_id,
++                    "client_secret": self.config.secret,
++                    "code": code,
++                    "redirect_uri": self.config.redirect,
++                },
++            )
++            value = self._token_value(result)
++        return self._authorization(result, value)
+ 
+     def _inspect_token(self, value: str, fallback_expiry: int | None) -> SystemToken:
+-        metadata = self._graph(
+-            "GET",
+-            "debug_token",
+-            f"{self.config.app_id}|{self.config.secret}",
+-            params={"input_token": value},
+-        ).get("data")
+-        if (
+-            not isinstance(metadata, dict)
+-            or metadata.get("is_valid") is not True
+-            or str(metadata.get("app_id", "")) != self.config.app_id
+-        ):
+-            raise InstagramError("A Meta não validou o token deste aplicativo.", auth=True)
+-        scopes = set(metadata.get("scopes") or [])
+-        scopes.update(item.get("scope") for item in (metadata.get("granular_scopes") or []))
+-        if missing := PUBLISH_SCOPES - scopes:
+-            raise InstagramError(
+-                "Autorize as permissões " + ", ".join(sorted(missing)) + " na configuração da Meta."
+-            )
+-        expiry = metadata.get("expires_at")
+-        expiry = (expiry or None) if type(expiry) is int and expiry >= 0 else fallback_expiry
+-        if expiry is not None and expiry <= int(time.time()):
+-            raise InstagramError("O token de usuário do sistema expirou.", auth=True)
+-        return SystemToken(value, expiry, RENEW_SCOPE in scopes)
+-
+-    def _authorization(self, result: dict) -> Authorization:
++        with self._oauth_step("debug_token"):
++            metadata = self._graph(
++                "GET",
++                "debug_token",
++                f"{self.config.app_id}|{self.config.secret}",
++                params={"input_token": value},
++            ).get("data")
++            if (
++                not isinstance(metadata, dict)
++                or metadata.get("is_valid") is not True
++                or str(metadata.get("app_id", "")) != self.config.app_id
++            ):
++                raise InstagramError("A Meta não validou o token deste aplicativo.", auth=True)
++            scopes = set(metadata.get("scopes") or [])
++            scopes.update(item.get("scope") for item in (metadata.get("granular_scopes") or []))
++            if missing := PUBLISH_SCOPES - scopes:
++                raise InstagramError(
++                    f"Autorize as permissões {', '.join(sorted(missing))} na configuração da Meta."
++                )
++            expiry = metadata.get("expires_at")
++            expiry = (expiry or None) if type(expiry) is int and expiry >= 0 else fallback_expiry
++            if expiry is not None and expiry <= int(time.time()):
++                raise InstagramError("O token de usuário do sistema expirou.", auth=True)
++            return SystemToken(value, expiry, RENEW_SCOPE in scopes)
++
++    @staticmethod
++    def _token_value(result: dict) -> str:
+         value = result.get("access_token")
+         if (
+             not isinstance(value, str)
+@@ -238,17 +352,23 @@
+             or not value.isprintable()
+         ):
+             raise InstagramError("A Meta não forneceu um token de usuário do sistema válido.")
++        return value
++
++    def _authorization(self, result: dict, value: str) -> Authorization:
+         lifetime = result.get("expires_in")
+         fallback = int(time.time()) + lifetime if type(lifetime) is int and lifetime > 0 else None
+-        business_id = self._graph("GET", "me", value, params={"fields": "client_business_id"}).get(
+-            "client_business_id"
+-        )
+-        if not meta_id(business_id):
+-            raise InstagramError(
+-                "Use uma configuração Instagram Login Compatible com token de usuário do sistema."
+-            )
++        with self._oauth_step("me"):
++            portfolio = self._graph("GET", "me", value, params={"fields": "client_business_id"})
++            business_id = portfolio.get("client_business_id")
++            if not meta_id(business_id):
++                raise InstagramError(
++                    "Use uma configuração Instagram Login Compatible "
++                    "com token de usuário do sistema."
++                )
+         token = self._inspect_token(value, fallback)
+-        return Authorization(business_id, token, self._assigned_accounts(value))
++        with self._oauth_step("me/assigned_instagram_accounts"):
++            accounts = self._assigned_accounts(value)
++        return Authorization(business_id, token, accounts)
+ 
+     def _assigned_accounts(self, token: str) -> list[AccountGrant]:
+         params: dict = {"fields": "id,username", "limit": 100}
+@@ -281,7 +401,7 @@
+                 "set_token_expires_in_60_days": "true" if expiring else "false",
+             },
+         )
+-        authorized = self._authorization(result)
++        authorized = self._authorization(result, self._token_value(result))
+         if authorized.business_id != business_id or not any(
+             grant.id == account for grant in authorized.accounts
+         ):
+@@ -334,6 +454,7 @@
+             body = self._request(
+                 "POST",
+                 f"https://rupload.facebook.com/ig-api-upload/{self.config.version}/{container}",
++                private=(self.config.secret, token),
+                 headers={
+                     "Authorization": f"OAuth {token}",
+                     "offset": "0",
+diff --git a/frontend/src/pages/Instagram.tsx b/frontend/src/pages/Instagram.tsx
+--- a/frontend/src/pages/Instagram.tsx
++++ b/frontend/src/pages/Instagram.tsx
+@@ -13,9 +13,12 @@
+ const OUTCOMES: Record<string, string> = {
+   cancelada: 'Conexão cancelada na Meta.',
+   sessao: 'A sessão expirou. Inicie a conexão novamente.',
+-  rede: 'A Meta não respondeu. Confira a conexão e tente novamente.',
++  rede: 'A comunicação com a Meta falhou. Confira o diagnóstico no terminal e inicie um novo login.',
+   acesso: 'A Meta não validou o acesso. Inicie a conexão novamente.',
+-  permissoes: 'A Meta recusou o acesso. Confira as permissões e o portfólio empresarial.',
++  'troca-codigo': 'A Meta recusou a troca do código de autorização. Confira o diagnóstico no terminal e inicie um novo login.',
++  portfolio: 'O Studio não conseguiu identificar o portfólio empresarial pela Meta. Confira o diagnóstico no terminal.',
++  'inspecao-token': 'O Studio não conseguiu confirmar as permissões do Instagram. Confira o diagnóstico no terminal.',
++  contas: 'O Studio não conseguiu listar as contas compartilhadas pela Meta. Confira o diagnóstico no terminal.',
+   'sem-contas': 'Nenhuma conta profissional foi compartilhada. Selecione a conta no portfólio empresarial durante o login.',
+   'outra-conta': 'O login não autorizou a conta que você escolheu reconectar. Entre no Instagram com essa conta e tente novamente.',
+ }
+diff --git a/tests/test_studio_instagram.py b/tests/test_studio_instagram.py
+--- a/tests/test_studio_instagram.py
++++ b/tests/test_studio_instagram.py
+@@ -146,10 +146,16 @@
+         calls.append(request.url.path)
+         if request.url.path.endswith("/oauth/access_token"):
+             assert request.url.host == "graph.facebook.com"
++            if request.url.params.get("redirect_uri") != query["redirect_uri"][0]:
++                return httpx.Response(
++                    400,
++                    json={"error": {"code": 100, "message": "The redirect_uri must match."}},
++                )
+             assert dict(request.url.params) == {
+                 "client_id": "111",
+                 "client_secret": "application-secret",
+                 "code": "fake-code",
++                "redirect_uri": DEFAULT_REDIRECT,
+             }
+             return httpx.Response(200, json={"access_token": TOKEN.value})
+         return grant_response(request, TOKEN.value, GRANTS)
+@@ -215,6 +221,116 @@
+     assert client.get(PREFIX + "/status").json()["publishing_enabled"] is False
+ 
+ 
++@pytest.mark.parametrize(
++    ("endpoint", "phase", "safe_message"),
++    [
++        ("oauth/access_token", "troca-codigo", "A Meta rejeitou a Redirect URI"),
++        ("me", "portfolio", "A Meta rejeitou um parâmetro"),
++        ("debug_token", "inspecao-token", "A Meta rejeitou um parâmetro"),
++        ("me/assigned_instagram_accounts", "contas", "A Meta rejeitou um parâmetro"),
++    ],
++)
++def test_callback_logs_which_graph_request_returned_code_100(
++    client, monkeypatch, caplog, endpoint, phase, safe_message
++):
++    calls = []
++    code = "private-oauth-value"
++    failing_path = f"/v27.0/{endpoint}"
++
++    def response(request):
++        calls.append(request.url.path)
++        if request.url.path == failing_path:
++            message = "Invalid redirect_uri" if phase == "troca-codigo" else "Invalid parameter"
++            error = {
++                "code": 100,
++                "error_subcode": 123,
++                "fbtrace_id": "MetaTrace123",
++                "message": f"{message}\n{CONFIG.secret} {TOKEN.value} {code} private-unknown-token",
++            }
++            return httpx.Response(400, json={"error": error})
++        if request.url.path.endswith("/oauth/access_token"):
++            return httpx.Response(200, json={"access_token": TOKEN.value})
++        return grant_response(request, TOKEN.value, GRANTS)
++
++    mock_meta(monkeypatch, response)
++    caplog.set_level(logging.INFO, logger="httpx")
++    _, query = start_login(client)
++    state = query["state"][0]
++    callback = client.get(PREFIX + "/oauth/callback", params={"state": state, "code": code})
++    assert callback.headers["location"] == f"/instagram?conexao={phase}"
++    assert calls[-1] == failing_path
++    assert client.get(PREFIX + "/accounts").json() == []
++    saved = (paths.root() / "instagram" / "oauth.log").read_text(encoding="utf-8")
++    for log in (caplog.text, saved):
++        assert f"etapa={phase} endpoint=GET graph.facebook.com{failing_path}" in log
++        assert "http=400 codigo=100 subcodigo=123 referencia=MetaTrace123" in log
++        assert safe_message in log
++        for private in (CONFIG.secret, TOKEN.value, code, state, "private-unknown-token"):
++            assert private not in log
++        assert "appsecret_proof" not in log
++    assert len(saved.splitlines()) == 1
++
++
++def test_callback_logs_nested_token_error_without_echoing_input_token(client, monkeypatch):
++    def response(request):
++        if request.url.path.endswith("/oauth/access_token"):
++            return httpx.Response(200, json={"access_token": TOKEN.value})
++        if request.url.path.endswith("/debug_token"):
++            return httpx.Response(
++                200,
++                json={
++                    "data": {
++                        "is_valid": False,
++                        "error": {
++                            "code": 190,
++                            "subcode": 463,
++                            "message": "Input_token not valid: " + TOKEN.value,
++                            "fbtrace_id": TOKEN.value,
++                        },
++                    }
++                },
++            )
++        return grant_response(request, TOKEN.value, GRANTS)
++
++    mock_meta(monkeypatch, response)
++    _, query = start_login(client)
++    callback = client.get(
++        PREFIX + "/oauth/callback", params={"state": query["state"][0], "code": "expired-token"}
++    )
++    assert callback.headers["location"].endswith("conexao=acesso")
++    saved = (paths.root() / "instagram" / "oauth.log").read_text(encoding="utf-8")
++    assert "endpoint=GET graph.facebook.com/v27.0/debug_token" in saved
++    assert "http=200 codigo=190 subcodigo=463" in saved
++    assert TOKEN.value not in saved
++    assert "referencia=" not in saved
++
++
++def test_callback_distinguishes_outbound_windows_connection_reset(client, monkeypatch):
++    code = "private-code-after-reset"
++    calls = []
++
++    def response(request):
++        calls.append(request.url.path)
++        reset = ConnectionResetError("private-reset-details " + code)
++        reset.winerror = 10054
++        raise httpx.ReadError("Private request URL: " + str(request.url)) from reset
++
++    mock_meta(monkeypatch, response)
++    _, query = start_login(client)
++    callback = client.get(
++        PREFIX + "/oauth/callback", params={"state": query["state"][0], "code": code}
++    )
++    assert callback.headers["location"].endswith("conexao=rede")
++    assert calls == ["/v27.0/oauth/access_token"]
++    saved = (paths.root() / "instagram" / "oauth.log").read_text(encoding="utf-8")
++    assert "etapa=troca-codigo" in saved
++    assert "transporte=WinError-10054" in saved
++    assert "codigo=" not in saved
++    assert code not in saved
++    assert CONFIG.secret not in saved
++    assert "private-reset-details" not in saved
++
++
+ def test_http_callback_is_rejected_for_unified_login(client, monkeypatch):
+     monkeypatch.setenv("AI_SHORTS_META_REDIRECT_URI", DEFAULT_REDIRECT.replace("https:", "http:"))
+     status = client.get(PREFIX + "/status").json()
+@@ -335,7 +451,9 @@
+             "code": "missing-scope",
+         },
+     )
+-    assert callback.headers["location"].endswith("conexao=permissoes")
++    assert callback.headers["location"].endswith("conexao=inspecao-token")
++    saved = (paths.root() / "instagram" / "oauth.log").read_text(encoding="utf-8")
++    assert "Autorize as permissões instagram_content_publish" in saved
+     assert client.get(PREFIX + "/accounts").json() == []
+ 
+ 

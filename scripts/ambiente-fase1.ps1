@@ -10,6 +10,13 @@ $faceModelHome = Join-Path $fase1Root 'cache/mediapipe'
 $faceModelFile = Join-Path $faceModelHome 'models/face_landmarker.task'
 $phaseModel = 'qwen2.5:7b'
 $ollamaUrl = 'http://127.0.0.1:11434'
+$metaLocalHostname = 'localhost.localdomain'
+$metaRedirectUri = 'https://{0}:8000/api/instagram/oauth/callback' -f $metaLocalHostname
+$metaTlsDir = if ($env:AI_SHORTS_META_TLS_DIR) {
+    $env:AI_SHORTS_META_TLS_DIR
+} else {
+    Join-Path $env:LOCALAPPDATA 'AI Shorts Studio/tls'
+}
 
 $env:UV_CACHE_DIR = Join-Path $fase1Root 'cache/uv'
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $fase1Root 'tools/python'
