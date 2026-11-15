@@ -1,0 +1,3158 @@
+diff --git a/backend/autoclip/app.py b/backend/autoclip/app.py
+--- a/backend/autoclip/app.py
++++ b/backend/autoclip/app.py
+@@ -24,6 +24,9 @@
+ from .instagram.worker import publisher
+ from .jobs.events import broker
+ from .jobs.queue import queue
++from .stories.api import router as stories_router
++from .stories.runner import StoryRunner
++from .stories.store import StoryStore
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -54,12 +57,16 @@
+     protect_oauth_logs()
+ 
+     broker.bind_loop(asyncio.get_running_loop())
++    workstation = asyncio.Lock()
++    stories = StoryRunner(StoryStore(), workstation)
++    await asyncio.to_thread(stories.store.recover)
++    app.state.stories = stories
+ 
+     # Serving the API without a worker is useful for debugging a stuck queue and
+     # makes API tests deterministic — jobs stay queued instead of racing off.
+     worker_enabled = os.environ.get(ENV_NO_WORKER) != "1"
+     if worker_enabled:
+-        await queue.start()
++        await queue.start(workstation)
+     else:
+         log.info("Job worker disabled by %s=1.", ENV_NO_WORKER)
+ 
+@@ -70,7 +77,9 @@
+             yield
+     finally:
+         if worker_enabled:
+-            await queue.stop()
++            await asyncio.gather(stories.stop(), queue.stop())
++        else:
++            await stories.stop()
+ 
+ 
+ def create_app() -> FastAPI:
+@@ -83,6 +92,7 @@
+ 
+     app.include_router(api_router)
+     app.include_router(instagram_router)
++    app.include_router(stories_router)
+ 
+     @app.get("/api/health")
+     async def health() -> dict:
+diff --git a/backend/autoclip/instagram/media.py b/backend/autoclip/instagram/media.py
+--- a/backend/autoclip/instagram/media.py
++++ b/backend/autoclip/instagram/media.py
+@@ -9,6 +9,7 @@
+ from .. import db, paths
+ from ..db.models import new_id
+ from ..pipeline import ffmpeg
++from ..stories.store import StoryStore
+ from .meta import InstagramError
+ from .store import Store
+ 
+@@ -25,11 +26,19 @@
+         rows = conn.execute(
+             EXPORT_FIELDS + " ORDER BY e.id = ? DESC, e.created_at DESC LIMIT 100", (preferred,)
+         )
+-        return [
++        clips = [
+             {key: row[key] for key in ("id", "title", "created_at", "size_bytes")}
+             for row in rows
+             if available_export(row["path"])
+         ]
++    stories = [
++        {**{key: row[key] for key in ("id", "title", "created_at", "size_bytes")}, "kind": "story"}
++        for row in StoryStore().exports(preferred)
++    ]
++    return sorted(
++        [*clips, *stories], key=lambda item: (item["id"] == preferred, item["created_at"]),
++        reverse=True,
++    )[:100]
+ 
+ 
+ def available_export(filename: str) -> Path | None:
+@@ -57,8 +66,17 @@
+     with db.connection() as conn:
+         export = conn.execute(EXPORT_FIELDS + " AND e.id = ?", (export_id,)).fetchone()
+     source = available_export(export["path"]) if export else None
++    title = (export["title"] or "Corte sem título") if export else ""
+     if source is None:
+-        raise InstagramError("Exporte um corte vertical 9:16 disponível para preparar o Reel.")
++        stories = StoryStore()
++        story = stories.get_export(export_id)
++        if story:
++            source = stories.export_path(story)
++            title = story["title"]
++    if source is None:
++        raise InstagramError(
++            "Escolha uma exportação vertical 9:16 disponível para preparar o Reel."
++        )
+     reel = new_id()
+     target = store.media(reel)
+     target.parent.mkdir(parents=True, exist_ok=True)
+@@ -68,7 +86,7 @@
+         build_snapshot(source, partial)
+         digest = sha256(partial)
+         partial.replace(target)
+-        store.create_draft(reel, export_id, export["title"] or "Corte sem título", digest, now)
++        store.create_draft(reel, export_id, title, digest, now)
+         saved = True
+     finally:
+         partial.unlink(missing_ok=True)
+diff --git a/backend/autoclip/jobs/queue.py b/backend/autoclip/jobs/queue.py
+--- a/backend/autoclip/jobs/queue.py
++++ b/backend/autoclip/jobs/queue.py
+@@ -42,17 +42,19 @@
+         # subsequent event loop in the process fail with "bound to a different
+         # event loop".
+         self._wakeup: asyncio.Event | None = None
++        self._workstation: asyncio.Lock | None = None
+         self._running_job_id: str | None = None
+         self._cancel_requested: set[str] = set()
+         self._stopping = False
+ 
+     # -- lifecycle ---------------------------------------------------------
+ 
+-    async def start(self) -> None:
++    async def start(self, workstation: asyncio.Lock | None = None) -> None:
+         """Start the worker and requeue anything left running by a crash."""
+         self._requeue_interrupted()
+         self._stopping = False
+         self._wakeup = asyncio.Event()
++        self._workstation = workstation if workstation is not None else asyncio.Lock()
+         self._task = asyncio.create_task(self._worker(), name="autoclip-job-queue")
+         self.notify()
+ 
+@@ -66,6 +68,7 @@
+                 await self._task
+             self._task = None
+         self._wakeup = None
++        self._workstation = None
+ 
+     def notify(self) -> None:
+         """Wake the worker — call after enqueuing a job.
+@@ -110,7 +113,8 @@
+ 
+     async def _worker(self) -> None:
+         wakeup = self._wakeup
+-        assert wakeup is not None
++        workstation = self._workstation
++        assert wakeup is not None and workstation is not None
+ 
+         while not self._stopping:
+             wakeup.clear()
+@@ -119,8 +123,9 @@
+                 await wakeup.wait()
+                 continue
+ 
+-            if not self._stopping and store.claim_job(job.id):
+-                await self._run_one(job)
++            async with workstation:
++                if not self._stopping and store.claim_job(job.id):
++                    await self._run_one(job)
+ 
+     async def _run_one(self, job: Job) -> None:
+         source = await asyncio.to_thread(store.get_source, job.source_id)
+diff --git a/backend/autoclip/stories/__init__.py b/backend/autoclip/stories/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/__init__.py
+@@ -0,0 +1 @@
++"""Local cartoon production for AI Shorts Studio."""
+diff --git a/backend/autoclip/stories/api.py b/backend/autoclip/stories/api.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/api.py
+@@ -0,0 +1,181 @@
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++from typing import Annotated
++
++from fastapi import APIRouter, Depends, HTTPException, Request, Response
++from fastapi.responses import FileResponse
++
++from ..instagram.api import only_local
++from . import art, narration, writer
++from .runner import StoryRunner
++from .schema import HEIGHT, WIDTH, Character, Script, StoryData, StoryError, StorySpec, StoryTask
++from .store import Busy, StoryStore
++
++router = APIRouter(prefix="/api/stories", dependencies=[Depends(only_local)])
++
++
++def _runner(request: Request) -> StoryRunner:
++    return request.app.state.stories
++
++
++def _store(runner: Annotated[StoryRunner, Depends(_runner)]) -> StoryStore:
++    return runner.store
++
++
++def _error(error: Exception) -> HTTPException:
++    if isinstance(error, KeyError):
++        return HTTPException(404, "Projeto, cena ou arquivo indisponível.")
++    return HTTPException(409 if isinstance(error, Busy) else 422, str(error))
++
++
++def _file(
++    store: StoryStore, path: Path, media_type: str, filename: str | None = None
++) -> FileResponse:
++    resolved = path.resolve()
++    if not resolved.is_relative_to(store.home.resolve()) or not resolved.is_file():
++        raise HTTPException(404, "Arquivo da história indisponível.")
++    return FileResponse(
++        resolved,
++        media_type=media_type,
++        filename=filename,
++        headers={
++            "Cache-Control": "no-store",
++            "Cross-Origin-Resource-Policy": "same-origin",
++        },
++    )
++
++
++Store = Annotated[StoryStore, Depends(_store)]
++Runner = Annotated[StoryRunner, Depends(_runner)]
++
++
++class Edit(StoryData):
++    script: Script
++    spec: StorySpec
++
++
++@router.get("/options")
++async def options() -> dict:
++    problem = None
++    try:
++        models = await writer.installed_models()
++        if not models:
++            problem = "Inicie o Ollama do Studio com um dos modelos configurados para histórias."
++    except StoryError as error:
++        models, problem = [], str(error)
++    return {
++        "models": models,
++        "ollama_problem": problem,
++        "voices": list(narration.available_voices()),
++        "piper_installed": importlib.util.find_spec("piper") is not None,
++        "width": WIDTH,
++        "height": HEIGHT,
++        "word_captions": False,
++    }
++
++
++@router.get("")
++def projects(store: Store) -> list[dict]:
++    return store.projects()
++
++
++@router.post("", status_code=201)
++def create(spec: StorySpec, store: Store) -> dict:
++    return store.create(spec)
++
++
++@router.get("/style-preview")
++def style_preview(store: Store) -> FileResponse:
++    png = art.style_preview(store.home / "cache" / "art")
++    return _file(store, png, "image/png")
++
++
++@router.get("/exports/{version}/video")
++def download(version: str, store: Store, download: bool = False) -> FileResponse:
++    export = store.get_export(version)
++    path = store.export_path(export) if export else None
++    if path is None:
++        raise HTTPException(404, "MP4 da história indisponível.")
++    return _file(store, path, "video/mp4", f"historia-{version}.mp4" if download else None)
++
++
++@router.get("/exports/{version}/captions")
++def captions(version: str, store: Store) -> FileResponse:
++    export = store.get_export(version)
++    if export is None:
++        raise HTTPException(404, "Legendas da história indisponíveis.")
++    path = store.output(export["project_id"], version) / "legendas.srt"
++    return _file(store, path, "application/x-subrip", f"historia-{version}.srt")
++
++
++@router.get("/{project}")
++def get(project: str, store: Store) -> dict:
++    try:
++        return store.get(project)
++    except KeyError as error:
++        raise _error(error) from None
++
++
++@router.put("/{project}")
++def save(project: str, edit: Edit, store: Store) -> dict:
++    try:
++        return store.save(project, edit.spec, edit.script)
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
++@router.post("/{project}/approve")
++def approve(project: str, store: Store) -> dict:
++    try:
++        return store.approve(project)
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
++@router.post("/{project}/tasks", status_code=202)
++async def start(project: str, operation: StoryTask, runner: Runner) -> dict:
++    try:
++        return await runner.start(project, operation)
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
++@router.post("/{project}/resume", status_code=202)
++async def resume(project: str, runner: Runner) -> dict:
++    try:
++        row = runner.store.get(project)
++        if row["status"] not in {"cancelado", "falhou", "interrompido"} or not row["task"]:
++            raise Busy("Este projeto está sem uma tarefa interrompida.")
++        return await runner.start(project, StoryTask.model_validate(row["task"]))
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
++@router.post("/{project}/cancel", status_code=204)
++async def cancel(project: str, runner: Runner) -> Response:
++    try:
++        runner.cancel(project)
++        return Response(status_code=204)
++    except Busy as error:
++        raise _error(error) from None
++
++
++@router.get("/{project}/audio/{version}")
++def audio(project: str, version: str, store: Store) -> FileResponse:
++    row = get(project, store)
++    if row["audio_id"] != version:
++        raise HTTPException(404, "Narração indisponível para esta versão.")
++    return _file(store, store.output(project, version) / "narracao.wav", "audio/wav")
++
++
++@router.get("/{project}/characters/{key}")
++def reference(project: str, key: str, store: Store) -> FileResponse:
++    row = get(project, store)
++    characters = (row["script"] or {}).get("characters", [])
++    character = next((item for item in characters if item["id"] == key), None)
++    if character is None:
++        raise HTTPException(404, "Ficha visual indisponível.")
++    png = art.reference(store.home / "cache" / "art", Character.model_validate(character))
++    return _file(store, png, "image/png")
+diff --git a/backend/autoclip/stories/art.py b/backend/autoclip/stories/art.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/art.py
+@@ -0,0 +1,360 @@
++"""Original flat artwork. Each expression uses the same reusable body and head geometry."""
++
++from __future__ import annotations
++
++import hashlib
++import math
++from collections.abc import Callable
++from dataclasses import dataclass
++from pathlib import Path
++from tempfile import NamedTemporaryFile
++
++from PIL import Image, ImageColor, ImageDraw
++
++from .schema import HEIGHT, WIDTH, Character, Scene
++
++INK = "#251f2b"
++CREAM = "#fff1d8"
++PINK = "#ee9b9c"
++GOLD = "#fed078"
++TEAL = "#93d0bd"
++ASSET_VERSION = "cartoon-v1"
++SIZE = 400
++CANVAS = (WIDTH, HEIGHT)
++PALETTES = {
++    "dia": ("#d7ebed", "#b9d4cb", "#87b5a1", "#57a290", "#486b6a"),
++    "entardecer": ("#f6d4c6", "#e3b4c8", "#c692a7", "#a46d91", "#6e526e"),
++    "noite": ("#434261", "#555077", "#626186", "#7473a3", "#a6a0c2"),
++}
++
++
++def _tone(color: str, other: str, amount: float) -> tuple[int, int, int]:
++    first = ImageColor.getrgb(color)
++    second = ImageColor.getrgb(other)
++    return tuple(round(a + (b - a) * amount) for a, b in zip(first, second, strict=True))
++
++
++def _ellipse(draw: ImageDraw.ImageDraw, box, fill, width: int = 8) -> None:
++    draw.ellipse(box, fill=fill, outline=INK, width=width)
++
++
++def _rounded(draw: ImageDraw.ImageDraw, box, radius, fill, width: int = 8) -> None:
++    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=INK, width=width)
++
++
++def _star(draw: ImageDraw.ImageDraw, x: float, y: float, size: float, fill: str) -> None:
++    points = []
++    for i in range(10):
++        angle = i * math.pi / 5 - math.pi / 2
++        radius = size if i % 2 == 0 else size * 0.46
++        points.append((x + math.cos(angle) * radius, y + math.sin(angle) * radius))
++    draw.polygon(points, fill=fill, outline=INK, width=max(2, round(size / 11)))
++
++
++def _body(character: Character) -> Image.Image:
++    image = Image.new("RGBA", (SIZE, SIZE))
++    draw = ImageDraw.Draw(image)
++    base = character.color
++    lighter = _tone(base, CREAM, 0.7)
++    if character.species == "robo":
++        _rounded(draw, (108, 204, 292, 345), 40, base)
++        _rounded(draw, (133, 310, 186, 365), 19, lighter)
++        _rounded(draw, (214, 310, 267, 365), 19, lighter)
++        _rounded(draw, (157, 250, 243, 306), 14, lighter, 5)
++        for x in (178, 200, 222):
++            draw.ellipse((x - 5, 271, x + 5, 281), fill=INK)
++    else:
++        if character.species in {"cachorro", "gato"}:
++            draw.line([(258, 308), (305, 282), (321, 239)], fill=INK, width=29, joint="curve")
++            draw.line([(258, 308), (305, 282), (321, 239)], fill=base, width=13, joint="curve")
++            draw.ellipse((314, 233, 328, 247), fill=base)
++        _ellipse(draw, (101, 193, 299, 354), base)
++        draw.ellipse((145, 220, 255, 331), fill=lighter)
++        _ellipse(draw, (109, 311, 190, 366), base, 7)
++        _ellipse(draw, (210, 311, 291, 366), base, 7)
++        for x in (140, 155, 245, 260):
++            draw.line((x, 353, x, 360), fill=INK, width=3)
++    if character.accessory == "lenco":
++        _rounded(draw, (117, 205, 283, 244), 17, TEAL, 6)
++        _rounded(draw, (229, 226, 265, 288), 10, TEAL, 6)
++    elif character.accessory == "gravata":
++        draw.polygon([(168, 212), (196, 228), (168, 244)], fill=PINK, outline=INK, width=5)
++        draw.polygon([(232, 212), (204, 228), (232, 244)], fill=PINK, outline=INK, width=5)
++        _ellipse(draw, (190, 219, 210, 238), PINK, 4)
++    elif character.accessory == "broche":
++        _star(draw, 242, 267, 18, GOLD)
++    return image
++
++
++def _head(character: Character, mood: str, blink: bool) -> Image.Image:
++    image = Image.new("RGBA", (SIZE, SIZE))
++    draw = ImageDraw.Draw(image)
++    base = character.color
++    dark = _tone(base, INK, 0.28)
++    light = _tone(base, CREAM, 0.76)
++    if character.species == "coelho":
++        for x in (136, 214):
++            _rounded(draw, (x, 9, x + 50, 132), 23, base)
++            draw.rounded_rectangle((x + 12, 25, x + 37, 108), 13, fill=PINK)
++    if character.species in {"gato", "coruja"}:
++        left_ear = [(102, 125), (111, 54), (165, 103)]
++        right_ear = [(SIZE - x, y) for x, y in left_ear]
++        for ear in (left_ear, right_ear):
++            draw.polygon(ear, fill=base, outline=INK, width=8)
++    if character.species == "robo":
++        draw.line((200, 49, 200, 91), fill=INK, width=8)
++        _ellipse(draw, (184, 27, 216, 58), PINK, 6)
++        _rounded(draw, (83, 85, 317, 224), 44, base)
++        _rounded(draw, (107, 106, 293, 202), 36, light, 5)
++    else:
++        _ellipse(draw, (81, 76, 319, 226), base)
++    if character.species == "cachorro":
++        _ellipse(draw, (67, 89, 120, 186), dark)
++        _ellipse(draw, (280, 89, 333, 186), dark)
++        draw.ellipse((127, 114, 188, 174), fill=dark)
++    if character.species == "coruja":
++        for x in (110, 198):
++            draw.ellipse((x, 99, x + 91, 187), fill=light)
++
++    for x in (157, 243):
++        if blink:
++            draw.arc((x - 14, 130, x + 14, 151), 15, 165, fill=INK, width=5)
++        else:
++            tall = 31 if mood in {"surpreso", "assustado"} else 25
++            draw.ellipse((x - 11, 140 - tall // 2, x + 11, 140 + tall // 2), fill=INK)
++            draw.ellipse((x - 5, 132, x + 1, 139), fill=CREAM)
++        if mood in {"surpreso", "assustado", "curioso", "triste"}:
++            slope = 3 if x == 157 else -3
++            draw.line((x - 12, 113 + slope, x + 12, 113 - slope), fill=INK, width=4)
++        draw.ellipse((x - 28, 164, x - 8, 176), fill=PINK)
++    if character.species in {"cachorro", "gato", "coelho"}:
++        draw.ellipse((160, 153, 240, 211), fill=light)
++        _ellipse(draw, (188, 162, 212, 177), INK, 3)
++    elif character.species == "coruja":
++        draw.polygon([(186, 153), (214, 153), (200, 174)], fill=GOLD, outline=INK, width=4)
++
++    if mood in {"surpreso", "assustado"}:
++        _ellipse(draw, (191, 181, 209, 200), INK, 4)
++    elif mood == "triste":
++        draw.arc((182, 183, 218, 204), 205, 335, fill=INK, width=5)
++    else:
++        draw.arc((179, 172, 221, 199), 15, 165, fill=INK, width=5)
++    if character.accessory == "oculos":
++        for x in (157, 243):
++            draw.ellipse((x - 27, 114, x + 27, 166), outline=INK, width=5)
++        draw.line((184, 139, 216, 139), fill=INK, width=5)
++    return image
++
++
++def _paw(character: Character) -> Image.Image:
++    image = Image.new("RGBA", (SIZE, SIZE))
++    draw = ImageDraw.Draw(image)
++    _rounded(draw, (250, 221, 292, 301), 19, character.color, 6)
++    draw.line((267, 287, 267, 296), fill=INK, width=3)
++    return image
++
++
++def _cached_png(folder: Path, key: str, make: Callable[[], Image.Image]) -> Path:
++    identity = hashlib.sha256(f"{ASSET_VERSION}/{key}".encode()).hexdigest()[:24]
++    name = folder / f"{identity}.png"
++    if name.is_file():
++        return name
++    folder.mkdir(parents=True, exist_ok=True)
++    with NamedTemporaryFile(dir=folder, suffix=".png", delete=False) as handle:
++        temp = Path(handle.name)
++    try:
++        make().save(temp, compress_level=3)
++        temp.replace(name)
++    finally:
++        temp.unlink(missing_ok=True)
++    return name
++
++
++def _layer(folder: Path, key: str, make: Callable[[], Image.Image]) -> Image.Image:
++    with Image.open(_cached_png(folder, key, make)) as image:
++        return image.copy()
++
++
++@dataclass
++class Actor:
++    body: Image.Image
++    head: Image.Image
++    blink: Image.Image
++    paw: Image.Image
++
++    def sprite(self, *, eyes_closed=False, nod=0.0, wave=0.0) -> Image.Image:
++        image = self.body.copy()
++        hand = (
++            self.paw.rotate(wave, Image.Resampling.BICUBIC, center=(263, 235)) if wave else self.paw
++        )
++        image.alpha_composite(hand)
++        face = self.blink if eyes_closed else self.head
++        if nod:
++            face = face.rotate(nod, Image.Resampling.BICUBIC, center=(200, 191))
++        image.alpha_composite(face)
++        return image
++
++
++def actor(cache: Path, character: Character, mood: str) -> Actor:
++    key = f"{character.species}/{character.color}/{character.accessory}"
++    return Actor(
++        _layer(cache, f"{key}/body", lambda: _body(character)),
++        _layer(cache, f"{key}/{mood}/face", lambda: _head(character, mood, False)),
++        _layer(cache, f"{key}/{mood}/blink", lambda: _head(character, mood, True)),
++        _layer(cache, f"{key}/paw", lambda: _paw(character)),
++    )
++
++
++def reference(cache: Path, character: Character) -> Path:
++    key = f"{character.species}/{character.color}/{character.accessory}/reference"
++    return _cached_png(cache, key, lambda: actor(cache, character, "calmo").sprite())
++
++
++def _background(setting: str, light: str) -> Image.Image:
++    sky, horizon, floor, accent, line = PALETTES[light]
++    image = Image.new("RGB", CANVAS, sky)
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((0, 742, WIDTH, HEIGHT), fill=floor)
++    draw.line((-10, 743, WIDTH + 10, 743), fill=line, width=6)
++    draw.ellipse((120, 844, 601, 948), fill=_tone(floor, sky, 0.38))
++
++    if setting in {"quarto", "oficina"}:
++        _rounded(draw, (393, 310, 649, 629), 27, horizon, 7)
++        _rounded(draw, (414, 331, 628, 604), 18, sky, 4)
++        draw.line((521, 332, 521, 603), fill=line, width=8)
++        draw.line((415, 469, 628, 469), fill=line, width=8)
++        _ellipse(draw, (548, 355, 603, 410), GOLD, 4)
++        draw.arc((430, 465, 598, 640), 192, 328, fill=accent, width=10)
++        _rounded(draw, (70, 454, 197, 501), 9, horizon, 5)
++        _star(draw, 130, 426, 24, GOLD)
++        _rounded(draw, (49, 666, 194, 779), 14, accent, 6)
++        draw.line((52, 715, 191, 715), fill=line, width=7)
++        for x in (107, 133):
++            draw.ellipse((x - 4, 693, x + 4, 701), fill=INK)
++    elif setting == "rua":
++        for x, height in ((-28, 213), (104, 164), (491, 147), (591, 236)):
++            y = 744 - height
++            _rounded(draw, (x, y, x + 151, 749), 23, horizon, 5)
++            for j in (25, 80):
++                _rounded(draw, (x + j, y + 32, x + j + 25, y + 72), 6, CREAM, 3)
++        _ellipse(draw, (500, 331, 565, 396), GOLD, 4)
++        draw.line((0, 961, WIDTH, 961), fill=line, width=4)
++    else:
++        _ellipse(draw, (518, 326, 602, 410), GOLD, 5)
++        draw.ellipse((-240, 597, 573, 1050), fill=horizon)
++        draw.ellipse((339, 583, 954, 1006), fill=horizon)
++        draw.rectangle((0, 816, WIDTH, HEIGHT), fill=floor)
++        draw.ellipse((105, 853, 616, 977), fill=_tone(floor, sky, 0.34))
++        if setting == "bosque":
++            for x, y in ((70, 515), (628, 550)):
++                _rounded(draw, (x - 15, y, x + 16, 822), 12, line, 5)
++                _ellipse(draw, (x - 72, y - 70, x + 65, y + 126), accent, 6)
++        else:
++            for x, y in ((82, 790), (614, 787), (666, 818)):
++                draw.line((x, y, x, y + 35), fill=line, width=5)
++                for dx, dy in ((0, -9), (-10, 0), (10, 0), (0, 9)):
++                    draw.ellipse((x + dx - 7, y + dy - 7, x + dx + 7, y + dy + 7), fill=CREAM)
++                draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=PINK)
++    for x, y in ((104, 357), (271, 399), (463, 478), (658, 380)):
++        if light == "noite":
++            draw.line((x - 5, y, x + 5, y), fill=CREAM, width=2)
++            draw.line((x, y - 5, x, y + 5), fill=CREAM, width=2)
++    return image
++
++
++def backdrop(cache: Path, scene: Scene) -> Image.Image:
++    return _layer(
++        cache,
++        f"background/{scene.setting}/{scene.light}",
++        lambda: _background(scene.setting, scene.light),
++    )
++
++
++def _prop(draw: ImageDraw.ImageDraw, kind: str, x: int, y: int, motion: float) -> None:
++    if kind == "estrela":
++        _star(draw, x, y, 43, GOLD)
++        _star(draw, x + 53, y - 34, 8 + motion * 3, CREAM)
++    elif kind == "chave":
++        _ellipse(draw, (x - 20, y - 42, x + 20, y - 3), GOLD, 6)
++        _rounded(draw, (x - 9, y - 10, x + 9, y + 38), 6, GOLD, 4)
++        draw.line((x + 5, y + 25, x + 22, y + 25), width=7, fill=INK)
++    elif kind == "lanterna":
++        _rounded(draw, (x - 33, y - 23, x + 35, y + 32), 15, TEAL, 6)
++        _rounded(draw, (x + 14, y - 31, x + 36, y + 37), 8, GOLD, 5)
++        draw.line((x + 47, y, x + 75, y), width=5, fill=GOLD)
++    elif kind in {"bilhete", "livro"}:
++        _rounded(draw, (x - 34, y - 26, x + 34, y + 27), 8, CREAM if kind == "bilhete" else TEAL, 6)
++        for offset in (-10, 3):
++            draw.line((x - 18, y + offset, x + 17, y + offset), fill=INK, width=3)
++    elif kind == "semente":
++        _ellipse(draw, (x - 18, y - 17, x + 19, y + 27), GOLD, 5)
++        _ellipse(draw, (x, y - 31, x + 24, y - 13), TEAL, 4)
++    elif kind == "bola":
++        _ellipse(draw, (x - 34, y - 34, x + 34, y + 34), PINK, 6)
++        draw.arc((x - 24, y - 24, x + 24, y + 24), 205, 295, fill=CREAM, width=6)
++
++
++def frame(
++    scene: Scene, background: Image.Image, cast: list[Actor], t: float, length: float
++) -> Image.Image:
++    image = background.copy()
++    size = (435 if len(cast) == 1 else 348) + (43 if scene.shot == "proximo" else 0)
++    centers = (360,) if len(cast) == 1 else (202, 515)
++    for i, (figure, x) in enumerate(zip(cast, centers, strict=True)):
++        breath = math.sin(t * 2.6 + i)
++        base_y = 891 - round(size * 0.88) + round(breath * 4)
++        if scene.motion == "pular" and i == 0:
++            base_y -= round(max(0, math.sin(t * 3.4)) ** 2 * 35)
++        if scene.motion == "entrar" and i == 0:
++            x -= round(max(0, 1 - t / 0.85) ** 2 * 263)
++        if scene.motion == "sair" and i == 0:
++            x += round(max(0, 1 - (length - t) / 0.85) ** 2 * 263)
++        sprite = figure.sprite(
++            eyes_closed=(t + i * 0.83 + 0.5) % 3.1 > 2.94,
++            nod=round(math.sin(t * 3.5) * 9) if scene.motion == "balancar_cabeca" and i == 0 else 0,
++            wave=round(-32 + math.sin(t * 6) * 15) if scene.motion == "acenar" and i == 0 else 0,
++        )
++        sprite = sprite.resize((size, size), Image.Resampling.BILINEAR)
++        image.paste(sprite, (x - size // 2, base_y), sprite)
++    prop_x = 358 if len(cast) == 2 else 514
++    _prop(
++        ImageDraw.Draw(image), scene.prop, prop_x, 858 + round(math.sin(t * 3) * 6), math.sin(t * 5)
++    )
++    return image
++
++
++def style_preview(cache: Path) -> Path:
++    def compose() -> Image.Image:
++        rabbit = Character(
++            id="pingo",
++            name="Pingo",
++            species="coelho",
++            visual="Pêssego",
++            color="#e5a277",
++            accessory="lenco",
++        )
++        owl = Character(
++            id="nina",
++            name="Nina",
++            species="coruja",
++            visual="Lavanda",
++            color="#b1a1d2",
++            accessory="broche",
++        )
++        scene = Scene(
++            id="exemplo",
++            title="Exemplo de arte",
++            setting="jardim",
++            light="noite",
++            seconds=5,
++            characters=[rabbit.id, owl.id],
++            narration="Uma estrela chegou ao jardim.",
++            action="Os dois observam a estrela.",
++            mood="curioso",
++            motion="respirar",
++            prop="estrela",
++        )
++        figures = [actor(cache, character, scene.mood) for character in (rabbit, owl)]
++        return frame(scene, backdrop(cache, scene), figures, 0.6, scene.seconds)
++
++    return _cached_png(cache, "style-preview", compose)
+diff --git a/backend/autoclip/stories/narration.py b/backend/autoclip/stories/narration.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/narration.py
+@@ -0,0 +1,261 @@
++"""Measure every spoken phrase from Piper's PCM output and build the scene timeline."""
++
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import json
++import os
++import re
++import sys
++import textwrap
++import wave
++from collections.abc import Callable
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++from .. import paths
++from ..pipeline import Cancelled, process
++from .schema import Script, StoryError, StorySpec
++
++Progress = Callable[[int, int, str], None]
++
++
++@dataclass(frozen=True)
++class Cue:
++    start: float
++    end: float
++    text: str
++
++
++@dataclass
++class Timeline:
++    boundaries: list[float]
++    cues: list[Cue]
++
++
++def voices_dir() -> Path:
++    custom = os.environ.get("AI_SHORTS_STORY_VOICES")
++    return Path(custom).expanduser().resolve() if custom else paths.root() / "stories" / "voices"
++
++
++def available_voices() -> dict[str, Path]:
++    if importlib.util.find_spec("piper") is None:
++        return {}
++    folder = voices_dir()
++    found = {}
++    for model in sorted(folder.glob("pt_BR-*.onnx")):
++        config = model.with_suffix(".onnx.json")
++        if not re.fullmatch(r"pt_BR-[A-Za-z0-9_-]{1,75}", model.stem):
++            continue
++        try:
++            if not all(file.resolve().is_relative_to(folder) for file in (model, config)):
++                continue
++            if model.stat().st_size == 0 or config.stat().st_size > 100_000:
++                continue
++            definition = json.loads(config.read_text(encoding="utf-8"))
++            if definition["espeak"]["voice"].lower().replace("_", "-") == "pt-br":
++                found[model.stem] = model
++        except (AttributeError, KeyError, TypeError, ValueError, OSError):
++            continue
++    return found
++
++
++def phrase_groups(script: Script) -> list[list[str]]:
++    groups = []
++    for scene in script.scenes:
++        fragments = [scene.narration, *(dialogue.text for dialogue in scene.dialogues)]
++        phrases = []
++        for fragment in fragments:
++            normalized = " ".join(fragment.split())
++            for sentence in re.split(r"(?<=[.!?…])\s+", normalized):
++                phrases.extend(textwrap.wrap(sentence, width=63, break_on_hyphens=False))
++        groups.append(phrases)
++    return groups
++
++
++def _fragment_path(cache: Path, voice: Path, speed: float, phrase: str) -> Path:
++    files = (voice, voice.with_suffix(".onnx.json"))
++    identity = [(item.stat().st_size, item.stat().st_mtime_ns) for item in files]
++    key = json.dumps(["piper-pcm-v1", voice.stem, identity, speed, phrase], ensure_ascii=False)
++    digest = hashlib.sha256(key.encode()).hexdigest()
++    return cache / f"{digest}.wav"
++
++
++def synthesize(
++    voice: Path,
++    speed: float,
++    todo: dict[str, Path],
++    cancelled: Callable[[], bool],
++    progress: Callable[[int], None],
++) -> None:
++    if not todo:
++        return
++    cache = next(iter(todo.values())).parent
++    cache.mkdir(parents=True, exist_ok=True)
++    with TemporaryDirectory(prefix="piper-", dir=cache) as work:
++        request = Path(work) / "frases.json"
++        request.write_text(
++            json.dumps(
++                {"speed": speed, "phrases": [[text, str(path)] for text, path in todo.items()]},
++                ensure_ascii=False,
++            ),
++            encoding="utf-8",
++        )
++
++        def parse(line: str) -> process.Update | None:
++            _, separator, count = line.strip().partition("piper_frases=")
++            return process.Update(int(count)) if separator and count.isdigit() else None
++
++        result = process.run(
++            [sys.executable, "-m", "autoclip.stories.narration", str(voice), str(request)],
++            label="Piper",
++            parse=parse,
++            idle_timeout_s=90,
++            on_progress=lambda update: progress(int(update.position)),
++            cancelled=cancelled,
++            kill_tree=True,
++        )
++    if result.stalled:
++        raise StoryError(
++            "O Piper ficou 90 segundos sem gerar uma frase. Verifique a voz instalada."
++        )
++    if result.code:
++        detail = result.stderr.strip().splitlines()[-1:]
++        suffix = f" {detail[0][:220]}" if detail else ""
++        raise StoryError(f"Falha na narração Piper (código {result.code}).{suffix}")
++
++
++def _pcm(filename: Path) -> tuple[int, bytes]:
++    try:
++        with wave.open(str(filename), "rb") as source:
++            if source.getnchannels() != 1 or source.getsampwidth() != 2:
++                raise StoryError("A voz deve fornecer áudio PCM mono de 16 bits.")
++            rate = source.getframerate()
++            frames = source.getnframes()
++            if not (8_000 <= rate <= 48_000 and 0 < frames <= rate * 60):
++                raise StoryError("O Piper devolveu uma frase vazia ou com duração inválida.")
++            data = source.readframes(frames)
++            if len(data) != frames * 2 or not any(data):
++                raise StoryError("O Piper devolveu áudio vazio. Confira o texto e a voz instalada.")
++            return rate, data
++    except (OSError, EOFError, wave.Error):
++        raise StoryError(
++            "Não foi possível ler o áudio gerado pelo Piper. Regenere a narração."
++        ) from None
++
++
++def make_narration(
++    script: Script,
++    spec: StorySpec,
++    voice: Path,
++    cache: Path,
++    output: Path,
++    cancelled: Callable[[], bool],
++    progress: Progress,
++    *,
++    refresh: bool = False,
++) -> Timeline:
++    groups = phrase_groups(script)
++    if sum(len(phrase.split()) for group in groups for phrase in group) > spec.seconds * 4:
++        raise StoryError("Há texto demais para a duração escolhida. Encurte a narração e as falas.")
++    fragments = {
++        phrase: _fragment_path(cache, voice, spec.speed, phrase)
++        for group in groups
++        for phrase in group
++    }
++    todo = {phrase: path for phrase, path in fragments.items() if refresh or not path.is_file()}
++    reused = len(fragments) - len(todo)
++    progress(reused, len(fragments), f"{reused} frases reaproveitadas")
++    synthesize(
++        voice,
++        spec.speed,
++        todo,
++        cancelled,
++        lambda count: progress(reused + count, len(fragments), "Convertendo texto em fala"),
++    )
++    buffers = {phrase: _pcm(path) for phrase, path in fragments.items()}
++    rates = {rate for rate, _ in buffers.values()}
++    if len(rates) != 1:
++        raise StoryError("As frases não usam a mesma taxa de amostragem. Regenere a narração.")
++    rate = rates.pop()
++    intro, gap, outro = round(rate * 0.15), round(rate * 0.11), round(rate * 0.19)
++    minimum = [
++        intro
++        + outro
++        + (len(group) - 1) * gap
++        + sum(len(buffers[phrase][1]) // 2 for phrase in group)
++        for group in groups
++    ]
++    total = spec.seconds * rate
++    extra = total - sum(minimum)
++    if extra < 0:
++        raise StoryError(
++            f"A fala ocupa pelo menos {sum(minimum) / rate:.1f} s e o vídeo tem {spec.seconds} s. "
++            "Encurte as falas, aumente a velocidade ou escolha um vídeo mais longo."
++        )
++    weight = sum(scene.seconds for scene in script.scenes)
++    boundaries, cues = [0.0], []
++    cursor, allocated, elapsed = 0, 0, 0.0
++    with wave.open(str(output / "narracao.wav"), "wb") as target:
++        target.setparams((1, 2, rate, 0, "NONE", "not compressed"))
++        for i, group in enumerate(groups):
++            if cancelled():
++                raise Cancelled("Narração cancelada.")
++            target.writeframesraw(b"\x00\x00" * intro)
++            cursor += intro
++            for j, phrase in enumerate(group):
++                data = buffers[phrase][1]
++                start = cursor / rate
++                target.writeframesraw(data)
++                cursor += len(data) // 2
++                cues.append(Cue(start, cursor / rate, phrase))
++                if j < len(group) - 1:
++                    target.writeframesraw(b"\x00\x00" * gap)
++                    cursor += gap
++            elapsed += script.scenes[i].seconds
++            next_padding = extra if i == len(groups) - 1 else round(extra * elapsed / weight)
++            tail = outro + next_padding - allocated
++            target.writeframesraw(b"\x00\x00" * tail)
++            cursor += tail
++            allocated = next_padding
++            boundaries.append(cursor / rate)
++    (output / "timeline.json").write_text(
++        json.dumps(
++            {"boundaries": boundaries, "cues": [asdict(cue) for cue in cues]}, ensure_ascii=False
++        ),
++        encoding="utf-8",
++    )
++    progress(len(fragments), len(fragments), "Narração medida e sincronizada")
++    return Timeline(boundaries, cues)
++
++
++def _piper_batch(voice_path: Path, request: Path) -> None:
++    from piper import PiperVoice, SynthesisConfig
++    from piper.phonemize_espeak import ESPEAK_DATA_DIR
++
++    voice_path, request = voice_path.resolve(), request.resolve()
++    task = json.loads(request.read_text(encoding="utf-8"))
++    data = ESPEAK_DATA_DIR
++    if os.name == "nt":
++        # The eSpeak C library can reject accented absolute paths on Windows.
++        # Use a relative path only in this worker, without changing Studio's cwd.
++        os.chdir(data.parent)
++        os.environ["ESPEAK_DATA_PATH"] = "."
++        data = Path("espeak-ng-data")
++    voice = PiperVoice.load(voice_path, use_cuda=False, espeak_data_dir=data)
++    options = SynthesisConfig(length_scale=1 / task["speed"], volume=0.9)
++    for count, (text, target) in enumerate(task["phrases"], start=1):
++        partial = request.parent / "frase.wav"
++        with wave.open(str(partial), "wb") as audio:
++            voice.synthesize_wav(
++                text.replace("[[", "").replace("]]", ""), audio, syn_config=options
++            )
++        _pcm(partial)
++        partial.replace(target)
++        print(f"piper_frases={count}", flush=True)
++
++
++if __name__ == "__main__":
++    _piper_batch(Path(sys.argv[1]), Path(sys.argv[2]))
+diff --git a/backend/autoclip/stories/render.py b/backend/autoclip/stories/render.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/render.py
+@@ -0,0 +1,225 @@
++"""Produce a true vertical MP4 from the story's layers and timed narration."""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from contextlib import suppress
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++import pysubs2
++from PIL import Image, ImageDraw, ImageFont
++
++from ..pipeline import Cancelled, ffmpeg
++from . import art, narration
++from .schema import FPS, HEIGHT, WIDTH, Script, StoryError, StorySpec
++
++Report = Callable[[str, int, int, str], None]
++
++
++def check_cancelled(cancelled: Callable[[], bool]) -> None:
++    if cancelled():
++        raise Cancelled("Geração de história cancelada.")
++
++
++def _font() -> ImageFont.FreeTypeFont:
++    backend = Path(__file__).resolve().parents[1]
++    fonts = sorted((backend / "static" / "assets").glob("Archivo-Variable*.ttf"))
++    source = backend.parents[1] / "frontend" / "src" / "fonts" / "Archivo-Variable.ttf"
++    if source.is_file():
++        fonts.append(source)
++    for font_path in [*fonts, "arialbd.ttf"]:
++        try:
++            font = ImageFont.truetype(font_path, 49)
++        except OSError:
++            continue
++        with suppress(OSError, ValueError):
++            font.set_variation_by_name("Bold")
++        return font
++    return ImageFont.load_default(size=49)
++
++
++def _caption(text: str, font: ImageFont.FreeTypeFont) -> Image.Image:
++    overlay = Image.new("RGBA", (WIDTH, 210))
++    draw = ImageDraw.Draw(overlay)
++    rows: list[str] = []
++    line = ""
++    for word in text.split():
++        proposal = f"{line} {word}".strip()
++        if line and draw.textlength(proposal, font=font) > WIDTH - 156:
++            rows.append(line)
++            line = word
++        else:
++            line = proposal
++    if line:
++        rows.append(line)
++    for i, row in enumerate(rows):
++        y = 12 + i * 58
++        draw.text(
++            (WIDTH // 2 - 10, y),
++            row,
++            anchor="mt",
++            font=font,
++            fill="#fffaf3",
++            stroke_width=5,
++            stroke_fill=art.INK,
++        )
++    return overlay
++
++
++def _captions(timeline: narration.Timeline, output: Path) -> dict[str, Image.Image]:
++    font = _font()
++    srt = pysubs2.SSAFile()
++    overlays = {}
++    for cue in timeline.cues:
++        srt.append(
++            pysubs2.SSAEvent(
++                start=round(cue.start * 1000), end=round(cue.end * 1000), text=cue.text
++            )
++        )
++        if cue.text not in overlays:
++            overlays[cue.text] = _caption(cue.text, font)
++    srt.save(str(output / "legendas.srt"), encoding="utf-8")
++    return overlays
++
++
++def render_story(
++    script: Script,
++    spec: StorySpec,
++    voice: Path,
++    cache: Path,
++    output: Path,
++    cancelled: Callable[[], bool],
++    report: Report,
++) -> ffmpeg.MediaInfo:
++    art_dir = cache / "art"
++    characters = {character.id: character for character in script.characters}
++    report("personagens", 0, len(characters), "Preparando fichas visuais")
++    for i, character in enumerate(characters.values(), start=1):
++        check_cancelled(cancelled)
++        art.reference(art_dir, character)
++        report("personagens", i, len(characters), character.name)
++
++    report("cenarios", 0, len(script.scenes), "Preparando fundos reutilizáveis")
++    backgrounds = []
++    for i, scene in enumerate(script.scenes, start=1):
++        check_cancelled(cancelled)
++        backgrounds.append(art.backdrop(art_dir, scene))
++        report("cenarios", i, len(script.scenes), scene.title)
++
++    timeline = narration.make_narration(
++        script,
++        spec,
++        voice,
++        cache / "audio",
++        output,
++        cancelled,
++        lambda done, total, message: report("narracao", done, total, message),
++    )
++    report("animacao", 0, len(script.scenes), "Preparando expressões, gestos e enquadramentos")
++    actors = []
++    for i, scene in enumerate(script.scenes, start=1):
++        check_cancelled(cancelled)
++        actors.append([art.actor(art_dir, characters[key], scene.mood) for key in scene.characters])
++        report("animacao", i, len(script.scenes), scene.title)
++
++    report("legendas", 0, len(timeline.cues), "Preparando legendas por frase")
++    overlays = _captions(timeline, output)
++    report("legendas", len(timeline.cues), len(timeline.cues), "Tempos obtidos do áudio")
++
++    final = output / "historia.mp4"
++    partial = output / "renderizando.mp4"
++    try:
++        with TemporaryDirectory(prefix="quadros-", dir=output) as working:
++            frames = Path(working)
++            count = spec.seconds * FPS
++            report("renderizacao", 0, count, "Desenhando quadros")
++            scene_index, cue_index = 0, 0
++            previous, fade_from = None, None
++            for i in range(count):
++                check_cancelled(cancelled)
++                at = i / FPS
++                if at >= timeline.boundaries[scene_index + 1]:
++                    scene_index += 1
++                    fade_from = previous
++                start, end = timeline.boundaries[scene_index : scene_index + 2]
++                elapsed = at - start
++                frame = art.frame(
++                    script.scenes[scene_index],
++                    backgrounds[scene_index],
++                    actors[scene_index],
++                    elapsed,
++                    end - start,
++                )
++                if fade_from is not None and elapsed < 0.23:
++                    frame = Image.blend(fade_from, frame, min(1.0, (elapsed + 0.04) / 0.23))
++                previous = frame.copy()
++                while cue_index < len(timeline.cues) and at >= timeline.cues[cue_index].end:
++                    cue_index += 1
++                if cue_index < len(timeline.cues) and at >= timeline.cues[cue_index].start:
++                    overlay = overlays[timeline.cues[cue_index].text]
++                    frame.paste(overlay, (0, 167), overlay)
++                frame.save(frames / f"{i:05d}.png", compress_level=1)
++                if (i + 1) % FPS == 0:
++                    report("renderizacao", i + 1, count, "Desenhando quadros")
++            units = spec.seconds * 1000
++            report("renderizacao", 0, units, "Codificando MP4")
++            ffmpeg.run(
++                [
++                    "-framerate",
++                    str(FPS),
++                    "-start_number",
++                    "0",
++                    "-i",
++                    str(frames / "%05d.png"),
++                    "-i",
++                    str(output / "narracao.wav"),
++                    "-map",
++                    "0:v:0",
++                    "-map",
++                    "1:a:0",
++                    "-vf",
++                    "fps=24,setsar=1",
++                    "-c:v",
++                    "libx264",
++                    "-pix_fmt",
++                    "yuv420p",
++                    "-crf",
++                    "19",
++                    "-preset",
++                    "veryfast",
++                    "-threads",
++                    "2",
++                    "-c:a",
++                    "aac",
++                    "-b:a",
++                    "128k",
++                    "-ar",
++                    "48000",
++                    "-ac",
++                    "2",
++                    "-t",
++                    str(spec.seconds),
++                    "-movflags",
++                    "+faststart",
++                    str(partial),
++                ],
++                total_duration_s=spec.seconds,
++                on_progress=lambda fraction: report(
++                    "renderizacao", round(fraction * units), units, "Codificando MP4"
++                ),
++                cancelled=cancelled,
++            )
++        info = ffmpeg.probe(partial)
++        if (
++            (info.width, info.height) != (WIDTH, HEIGHT)
++            or info.video_codec != "h264"
++            or info.audio_codec != "aac"
++            or abs(info.duration_s - spec.seconds) > 0.15
++        ):
++            raise StoryError("O MP4 saiu com formato ou duração incompatível. Confira o FFmpeg.")
++        check_cancelled(cancelled)
++        partial.replace(final)
++        return info
++    finally:
++        partial.unlink(missing_ok=True)
+diff --git a/backend/autoclip/stories/runner.py b/backend/autoclip/stories/runner.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/runner.py
+@@ -0,0 +1,148 @@
++from __future__ import annotations
++
++import asyncio
++import logging
++import threading
++
++from ..pipeline import Cancelled, ffmpeg
++from . import narration, render, writer
++from .schema import Script, StoryError, StorySpec, StoryTask
++from .store import Busy, StoryStore
++
++log = logging.getLogger(__name__)
++
++
++class StoryRunner:
++    def __init__(self, store: StoryStore, workstation: asyncio.Lock) -> None:
++        self.store = store
++        self.workstation = workstation
++        self.job: asyncio.Task | None = None
++        self.project: str | None = None
++        self.cancelled = threading.Event()
++        self.stopping = False
++
++    async def start(self, project: str, operation: StoryTask) -> dict:
++        if self.job is not None or self.stopping:
++            raise Busy("Aguarde ou cancele a história que está sendo produzida.")
++        row = await asyncio.to_thread(self.store.begin, project, operation)
++        self.project = project
++        self.cancelled.clear()
++        self.job = asyncio.create_task(
++            self._produce(row, operation), name=f"studio-story-{project}"
++        )
++        return row
++
++    def cancel(self, project: str) -> None:
++        if self.job is None or self.project != project:
++            raise Busy("Esta história está sem uma tarefa em andamento.")
++        self.cancelled.set()
++
++    async def stop(self) -> None:
++        self.stopping = True
++        self.cancelled.set()
++        if self.job is not None:
++            await self.job
++
++    async def _acquire(self) -> None:
++        while True:
++            render.check_cancelled(self.cancelled.is_set)
++            try:
++                await asyncio.wait_for(self.workstation.acquire(), timeout=0.25)
++                return
++            except TimeoutError:
++                continue
++
++    async def _produce(self, row: dict, operation: StoryTask) -> None:
++        project, run = row["id"], row["run_id"]
++        cancelled = self.cancelled.is_set
++
++        def progress(stage: str, done: int, total: int, detail: str) -> None:
++            self.store.progress(project, run, stage, done, total, detail)
++
++        try:
++            await self._acquire()
++            try:
++                render.check_cancelled(cancelled)
++                spec = StorySpec.model_validate(row["spec"])
++                script = Script.model_validate(row["script"]) if row["script"] else None
++                if operation.kind in {"roteiro", "cena"}:
++                    generated = await writer.write_story(
++                        spec,
++                        cancelled,
++                        lambda attempt: progress(
++                            "roteiro", 0, 0, f"Ollama · tentativa {attempt} de 2"
++                        ),
++                        script,
++                        operation.scene,
++                    )
++                    render.check_cancelled(cancelled)
++                    self.store.end(project, run, "rascunho", script=generated)
++                elif script is not None:
++                    await asyncio.to_thread(
++                        self._produce_media, row, spec, script, operation, progress
++                    )
++            finally:
++                self.workstation.release()
++        except Cancelled:
++            status = "interrompido" if self.stopping else "cancelado"
++            self.store.end(project, run, status)
++        except (StoryError, ffmpeg.FFmpegError, OSError) as error:
++            self.store.end(project, run, "falhou", error=str(error)[:1500])
++        except Exception:
++            log.exception("Falha interna na produção de história %s.", project)
++            self.store.end(
++                project, run, "falhou", error="Erro interno. Consulte o terminal do Studio."
++            )
++        finally:
++            self.project = None
++            self.job = None
++
++    def _produce_media(
++        self,
++        row: dict,
++        spec: StorySpec,
++        script: Script,
++        operation: StoryTask,
++        progress: render.Report,
++    ) -> None:
++        project, run = row["id"], row["run_id"]
++        cancelled = self.cancelled.is_set
++        voice = narration.available_voices().get(spec.voice)
++        if voice is None:
++            progress("narracao", 0, 0, "Aguardando uma voz local")
++            raise StoryError(
++                "Selecione uma voz pt-BR instalada. Use scripts/preparar-voz-historias.ps1."
++            )
++        output = self.store.output(project, run)
++        output.mkdir(parents=True)
++        cache = self.store.home / "cache"
++        if operation.kind == "audio":
++            narration.make_narration(
++                script,
++                spec,
++                voice,
++                cache / "audio",
++                output,
++                cancelled,
++                lambda done, total, message: progress("narracao", done, total, message),
++                refresh=operation.refresh,
++            )
++            render.check_cancelled(cancelled)
++            self.store.end(project, run, "rascunho", audio=True)
++            return
++
++        result = render.render_story(script, spec, voice, cache, output, cancelled, progress)
++        render.check_cancelled(cancelled)
++        self.store.end(
++            project,
++            run,
++            "finalizado",
++            audio=True,
++            exported=(
++                script.title,
++                result.width or 0,
++                result.height or 0,
++                result.duration_s,
++                (output / "historia.mp4").stat().st_size,
++            ),
++        )
+diff --git a/backend/autoclip/stories/schema.py b/backend/autoclip/stories/schema.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/schema.py
+@@ -0,0 +1,110 @@
++from __future__ import annotations
++
++from typing import Annotated, Literal
++
++from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
++
++MODELS = ("qwen3:4b-instruct", "qwen2.5:7b")
++WIDTH, HEIGHT = 720, 1280
++FPS = 12  # Draw on twos. Exports use 24 fps for browser and Reel compatibility.
++
++Genre = Literal["misterio", "terror", "suspense", "humor", "reviravolta", "aventura"]
++Species = Literal["cachorro", "gato", "coelho", "coruja", "robo"]
++Setting = Literal["quarto", "bosque", "jardim", "oficina", "rua"]
++Mood = Literal["calmo", "feliz", "surpreso", "assustado", "curioso", "triste"]
++Motion = Literal["respirar", "acenar", "balancar_cabeca", "entrar", "sair", "pular"]
++Prop = Literal["nenhum", "estrela", "chave", "bilhete", "lanterna", "livro", "semente", "bola"]
++Reference = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,15}$")]
++Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
++Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=400)]
++
++
++class StoryData(BaseModel):
++    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
++
++
++class StorySpec(StoryData):
++    idea: Annotated[str, StringConstraints(min_length=4, max_length=1200)]
++    genre: Genre = "misterio"
++    seconds: Literal[15, 30, 45, 60] = 15
++    model: Literal["qwen3:4b-instruct", "qwen2.5:7b"] = MODELS[0]
++    style: Literal["cartoon-2d"] = "cartoon-2d"
++    language: Literal["pt-BR"] = "pt-BR"
++    voice: str = Field(default="", pattern=r"^(pt_BR-[A-Za-z0-9_-]{1,75})?$")
++    speed: float = Field(default=1, ge=0.8, le=1.25)
++
++
++class Character(StoryData):
++    id: Reference
++    name: Title
++    species: Species
++    visual: Title
++    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
++    accessory: Literal["nenhum", "lenco", "gravata", "oculos", "broche"] = "nenhum"
++
++
++class Dialogue(StoryData):
++    speaker: Reference
++    text: Text
++
++
++class Scene(StoryData):
++    id: Reference
++    title: Title
++    setting: Setting
++    light: Literal["dia", "entardecer", "noite"]
++    characters: list[Reference] = Field(min_length=1, max_length=2)
++    narration: Text
++    dialogues: list[Dialogue] = Field(default_factory=list, max_length=2)
++    action: Text
++    mood: Mood
++    motion: Motion
++    prop: Prop = "nenhum"
++    shot: Literal["medio", "proximo"] = "medio"
++    seconds: float = Field(ge=1, le=30)
++
++    def validate_cast(self, cast: set[str]) -> None:
++        visible = set(self.characters)
++        if len(visible) != len(self.characters) or not visible.issubset(cast):
++            raise ValueError("Cada personagem da cena deve aparecer uma vez na ficha da história.")
++        if any(line.speaker not in visible for line in self.dialogues):
++            raise ValueError("A fala precisa pertencer a um personagem presente na cena.")
++
++
++class Script(StoryData):
++    title: Title
++    synopsis: Text
++    genre: Genre
++    setting: Title
++    characters: list[Character] = Field(min_length=1, max_length=4)
++    scenes: list[Scene] = Field(min_length=3, max_length=8)
++    ending: Text
++
++    @model_validator(mode="after")
++    def validate_references(self) -> Script:
++        cast = {character.id for character in self.characters}
++        if len(cast) != len(self.characters):
++            raise ValueError("Os identificadores dos personagens precisam ser únicos.")
++        if len({scene.id for scene in self.scenes}) != len(self.scenes):
++            raise ValueError("Os identificadores das cenas precisam ser únicos.")
++        for scene in self.scenes:
++            scene.validate_cast(cast)
++        return self
++
++
++class StoryTask(StoryData):
++    kind: Literal["roteiro", "cena", "audio", "render"]
++    scene: Reference | None = None
++    refresh: bool = False
++
++    @model_validator(mode="after")
++    def validate_operation(self) -> StoryTask:
++        if (self.scene is not None) != (self.kind == "cena"):
++            raise ValueError("Informe o identificador apenas ao regenerar uma cena.")
++        if self.refresh and self.kind != "audio":
++            raise ValueError("A regeneração do áudio exige uma tarefa de narração.")
++        return self
++
++
++class StoryError(RuntimeError):
++    """A production failure with a message suitable for the local editor."""
+diff --git a/backend/autoclip/stories/store.py b/backend/autoclip/stories/store.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/store.py
+@@ -0,0 +1,260 @@
++"""Durable local project, task and immutable export records."""
++
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++from collections.abc import Iterator
++from contextlib import closing, contextmanager
++from datetime import UTC, datetime
++from pathlib import Path
++
++from .. import db, paths
++from ..db.models import new_id
++from .schema import Script, StoryError, StorySpec, StoryTask
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS projects (
++    id TEXT PRIMARY KEY,
++    spec TEXT NOT NULL,
++    script TEXT,
++    approved INTEGER NOT NULL DEFAULT 0,
++    status TEXT NOT NULL DEFAULT 'rascunho',
++    stage TEXT,
++    completed INTEGER NOT NULL DEFAULT 0,
++    total INTEGER NOT NULL DEFAULT 0,
++    detail TEXT NOT NULL DEFAULT '',
++    error TEXT,
++    task TEXT,
++    run_id TEXT,
++    audio_id TEXT,
++    export_id TEXT,
++    updated_at TEXT NOT NULL
++);
++CREATE UNIQUE INDEX IF NOT EXISTS one_story_generation ON projects(status) WHERE status='gerando';
++CREATE TABLE IF NOT EXISTS exports (
++    id TEXT PRIMARY KEY,
++    project_id TEXT NOT NULL REFERENCES projects(id),
++    title TEXT NOT NULL,
++    width INTEGER NOT NULL,
++    height INTEGER NOT NULL,
++    duration REAL NOT NULL,
++    size_bytes INTEGER NOT NULL,
++    created_at TEXT NOT NULL
++);
++"""
++ID = re.compile(r"[0-9a-f]{16}")
++
++
++class Busy(StoryError):
++    """This project or another story is already being processed."""
++
++
++def _now() -> str:
++    return datetime.now(UTC).isoformat(timespec="milliseconds")
++
++
++class StoryStore:
++    def __init__(self, home: Path | None = None) -> None:
++        self.home = (home or paths.root()) / "stories"
++        self.database = self.home / "historias.sqlite3"
++
++    @contextmanager
++    def _connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
++        with closing(db.connect(self.database)) as connection, connection:
++            if write:
++                connection.execute("BEGIN IMMEDIATE")
++            yield connection
++
++    def initialize(self) -> None:
++        with self._connect() as connection:
++            connection.executescript(SCHEMA)
++
++    def recover(self) -> None:
++        self.initialize()
++        with self._connect(write=True) as connection:
++            connection.execute(
++                "UPDATE projects SET status='interrompido', error=? WHERE status='gerando'",
++                ("A produção foi interrompida. Retome para reaproveitar os arquivos preparados.",),
++            )
++
++    @staticmethod
++    def _row(connection: sqlite3.Connection, project: str) -> sqlite3.Row:
++        row = connection.execute("SELECT * FROM projects WHERE id=?", (project,)).fetchone()
++        if row is None:
++            raise KeyError(project)
++        return row
++
++    @staticmethod
++    def _read(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
++        exported = connection.execute(
++            "SELECT * FROM exports WHERE id=?", (row["export_id"],)
++        ).fetchone()
++        info = dict(row)
++        for field in ("spec", "script", "task"):
++            info[field] = json.loads(info[field]) if info[field] else None
++        info["approved"] = bool(info["approved"])
++        info["export"] = dict(exported) if exported else None
++        return info
++
++    def get(self, project: str) -> dict:
++        with self._connect() as connection:
++            return self._read(connection, self._row(connection, project))
++
++    def projects(self) -> list[dict]:
++        with self._connect() as connection:
++            rows = connection.execute("SELECT * FROM projects ORDER BY updated_at DESC")
++            return [
++                {
++                    "id": row["id"],
++                    "status": row["status"],
++                    "updated_at": row["updated_at"],
++                    "title": json.loads(row["script"])["title"]
++                    if row["script"]
++                    else json.loads(row["spec"])["idea"],
++                }
++                for row in rows
++            ]
++
++    def create(self, spec: StorySpec) -> dict:
++        project = new_id()
++        with self._connect(write=True) as connection:
++            connection.execute(
++                "INSERT INTO projects (id,spec,updated_at) VALUES (?,?,?)",
++                (project, spec.model_dump_json(), _now()),
++            )
++        return self.get(project)
++
++    def save(self, project: str, spec: StorySpec, script: Script) -> dict:
++        if script.genre != spec.genre:
++            raise StoryError("O gênero do roteiro deve ser o mesmo do projeto.")
++        with self._connect(write=True) as connection:
++            before = self._row(connection, project)
++            if before["status"] == "gerando":
++                raise Busy("Aguarde ou cancele a produção para editar este projeto.")
++            new_spec, new_script = spec.model_dump_json(), script.model_dump_json()
++            if before["spec"] != new_spec or before["script"] != new_script:
++                connection.execute(
++                    """UPDATE projects SET spec=?, script=?, approved=0, status='rascunho',
++                       stage=NULL, completed=0, total=0, detail='', error=NULL, audio_id=NULL,
++                       task=NULL, run_id=NULL, updated_at=? WHERE id=?""",
++                    (new_spec, new_script, _now(), project),
++                )
++        return self.get(project)
++
++    def approve(self, project: str) -> dict:
++        with self._connect(write=True) as connection:
++            row = self._row(connection, project)
++            if row["status"] == "gerando":
++                raise Busy("Aguarde a produção atual antes de aprovar.")
++            if not row["script"]:
++                raise StoryError("Gere e revise um roteiro antes de aprová-lo.")
++            connection.execute(
++                "UPDATE projects SET approved=1,updated_at=? WHERE id=?", (_now(), project)
++            )
++        return self.get(project)
++
++    def begin(self, project: str, task: StoryTask) -> dict:
++        try:
++            with self._connect(write=True) as connection:
++                row = self._row(connection, project)
++                if row["status"] == "gerando":
++                    raise Busy("Já existe uma produção para esta história.")
++                if task.kind != "roteiro" and not row["script"]:
++                    raise StoryError("Gere um roteiro para continuar.")
++                if task.kind == "cena" and task.scene not in {
++                    s["id"] for s in json.loads(row["script"])["scenes"]
++                }:
++                    raise StoryError("A cena não está mais neste roteiro.")
++                if task.kind == "render" and not row["approved"]:
++                    raise StoryError("Aprove o roteiro antes de gerar o vídeo.")
++                connection.execute(
++                    """UPDATE projects SET status='gerando', stage='aguardando', completed=0,
++                       total=0, detail='', error=NULL, task=?, run_id=?, updated_at=? WHERE id=?""",
++                    (task.model_dump_json(), new_id(), _now(), project),
++                )
++                return self._read(connection, self._row(connection, project))
++        except sqlite3.IntegrityError:
++            raise Busy(
++                "Já existe uma história sendo produzida. Aguarde ou cancele a tarefa atual."
++            ) from None
++
++    def progress(
++        self, project: str, run: str, stage: str, done: int, total: int, detail: str
++    ) -> None:
++        with self._connect(write=True) as connection:
++            connection.execute(
++                """UPDATE projects SET stage=?,completed=?,total=?,detail=?
++                   WHERE id=? AND run_id=? AND status='gerando'""",
++                (stage, done, total, detail, project, run),
++            )
++
++    def end(
++        self,
++        project: str,
++        run: str,
++        status: str,
++        *,
++        script: Script | None = None,
++        audio: bool = False,
++        exported: tuple[str, int, int, float, int] | None = None,
++        error: str | None = None,
++    ) -> None:
++        with self._connect(write=True) as connection:
++            row = self._row(connection, project)
++            if row["run_id"] != run or row["status"] != "gerando":
++                return
++            if exported:
++                connection.execute(
++                    "INSERT INTO exports VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++                    (run, project, *exported, _now()),
++                )
++            connection.execute(
++                """UPDATE projects SET status=?, updated_at=?, error=?, stage=?, detail='',
++                   script=?, approved=?, audio_id=?, export_id=? WHERE id=?""",
++                (
++                    status,
++                    _now(),
++                    error,
++                    "finalizado" if exported else row["stage"],
++                    script.model_dump_json() if script is not None else row["script"],
++                    0 if script is not None else row["approved"],
++                    None if script is not None else run if audio else row["audio_id"],
++                    run if exported else row["export_id"],
++                    project,
++                ),
++            )
++
++    def output(self, project: str, version: str) -> Path:
++        if not ID.fullmatch(project) or not ID.fullmatch(version):
++            raise KeyError(project)
++        return self.home / "projects" / project / version
++
++    def export_path(self, row: sqlite3.Row | dict) -> Path | None:
++        candidate = (self.output(row["project_id"], row["id"]) / "historia.mp4").resolve()
++        return (
++            candidate
++            if candidate.is_relative_to(self.home.resolve()) and candidate.is_file()
++            else None
++        )
++
++    def exports(self, preferred: str | None = None) -> list[dict]:
++        if not self.database.is_file():
++            return []
++        with self._connect() as connection:
++            return [
++                dict(row)
++                for row in connection.execute(
++                    "SELECT * FROM exports ORDER BY id=? DESC,created_at DESC LIMIT 100",
++                    (preferred,),
++                )
++                if self.export_path(row) is not None
++            ]
++
++    def get_export(self, version: str) -> dict | None:
++        if not self.database.is_file():
++            return None
++        with self._connect() as connection:
++            row = connection.execute("SELECT * FROM exports WHERE id=?", (version,)).fetchone()
++            return dict(row) if row else None
+diff --git a/backend/autoclip/stories/writer.py b/backend/autoclip/stories/writer.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/writer.py
+@@ -0,0 +1,158 @@
++from __future__ import annotations
++
++import asyncio
++import contextlib
++from collections.abc import Callable
++from urllib.parse import urlsplit
++
++import httpx
++from pydantic import ValidationError
++
++from .. import config
++from ..pipeline import Cancelled
++from ..providers.ollama_provider import OllamaProvider
++from .schema import MODELS, Scene, Script, StoryError, StorySpec
++
++SYSTEM = """Escreva histórias fictícias originais em português do Brasil para cartoon 2D.
++Entregue o JSON do esquema, sem markdown. Faça começo, desenvolvimento e final narrados.
++Use palavras simples, frases naturais e elementos que a biblioteca consegue desenhar.
++IDs distintos como c1, c2 e s1, s2; reutilize o ID em todas as aparições do personagem.
++Narre visualmente o que importa. 'action' descreve o acontecimento e 'motion' escolhe
++o gesto que o desenho consegue realizar. 'prop' é um objeto visível ou 'nenhum'.
++Use cores hexadecimais suaves para a ficha visual. Não imite personagens conhecidos.
++Omita os diálogos ou use uma lista vazia se a narração já for suficiente."""
++
++
++def provider(model: str = "") -> OllamaProvider:
++    settings = config.load().providers.get("ollama")
++    local = OllamaProvider(model, base_url=settings.base_url if settings else None)
++    try:
++        url = urlsplit(local.url)
++        port = url.port
++    except ValueError:
++        raise StoryError("Confira o endereço do Ollama nas Configurações do Studio.") from None
++    if (
++        url.scheme not in {"http", "https"}
++        or url.hostname not in {"localhost", "127.0.0.1", "::1"}
++        or url.username
++        or url.path
++        or url.query
++        or url.fragment
++        or port == 0
++    ):
++        raise StoryError("Configure um endereço local do Ollama nas Configurações do Studio.")
++    return local
++
++
++async def installed_models() -> list[str]:
++    status = await provider().health_check()
++    return [model for model in MODELS if model in (status.models or [])]
++
++
++async def _generation(url: str, payload: dict, cancelled: Callable[[], bool]) -> str:
++    async with httpx.AsyncClient(timeout=httpx.Timeout(240, connect=5), trust_env=False) as client:
++        task = asyncio.create_task(client.post(f"{url}/api/generate", json=payload))
++        try:
++            while not task.done():
++                if cancelled():
++                    raise Cancelled("Geração de roteiro cancelada.")
++                await asyncio.wait({task}, timeout=0.25)
++            response = task.result()
++            response.raise_for_status()
++            value = response.json().get("response")
++            return value if isinstance(value, str) and len(value) < 32_000 else ""
++        except (httpx.RequestError, httpx.HTTPStatusError) as error:
++            if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 404:
++                raise StoryError("O modelo selecionado não está instalado no Ollama.") from None
++            raise StoryError(
++                "O Ollama local não concluiu o roteiro. Confira o serviço e o modelo."
++            ) from None
++        except (ValueError, AttributeError):
++            return ""
++        finally:
++            if not task.done():
++                task.cancel()
++                with contextlib.suppress(asyncio.CancelledError):
++                    await task
++
++
++async def write_story(
++    spec: StorySpec,
++    cancelled: Callable[[], bool],
++    attempt: Callable[[int], None],
++    script: Script | None = None,
++    scene_id: str | None = None,
++) -> Script:
++    local = provider(spec.model)
++    schema = Scene if script is not None and scene_id is not None else Script
++    count = {15: 3, 30: 4, 45: 5, 60: 6}[spec.seconds]
++    limit = int(spec.seconds * 2.0)
++    max_per_scene = limit // count
++    if schema is Scene and script is not None:
++        original = next(scene for scene in script.scenes if scene.id == scene_id)
++        budget = max(6, int(original.seconds * 1.9))
++        prompt = (
++            f"Reescreva só a cena {scene_id}, com o mesmo ID e personagens existentes. "
++            f"Use até {budget} palavras faladas, incluindo diálogos. Preserve o arco.\n"
++            f"História atual: {script.model_dump_json()}"
++        )
++    else:
++        prompt = (
++            f"Ideia original: {spec.idea}\nGênero: {spec.genre}. "
++            f"São exatamente {count} cenas e {spec.seconds} segundos. Cada 'narration' "
++            f"tem UMA frase curta de até {max_per_scene} palavras. Deixe 'dialogues' vazio. "
++            f"No máximo {limit} palavras faladas no vídeo todo. "
++            "O final precisa aparecer na última narração. "
++            "Use de um a três personagens. Os segundos estimados somam a duração escolhida."
++        )
++
++    feedback = ""
++    for number in (1, 2):
++        if cancelled():
++            raise Cancelled("Geração de roteiro cancelada.")
++        attempt(number)
++        payload = {
++            "model": local.model,
++            "system": SYSTEM,
++            "prompt": prompt + feedback,
++            "format": schema.model_json_schema(),
++            "stream": False,
++            "keep_alive": 0,
++            "options": {"temperature": 0.35 if number == 1 else 0.1, "num_predict": 2800},
++        }
++        if spec.model.startswith("qwen3:"):
++            payload["think"] = False
++        output = await _generation(local.url, payload, cancelled)
++        try:
++            generated = schema.model_validate_json(output)
++            if isinstance(generated, Scene) and script is not None:
++                if _words(generated) > budget + 3:
++                    feedback = f"\nEncurte a narração e falas para até {budget} palavras."
++                    continue
++                generated.id = original.id
++                scenes = [generated if item.id == original.id else item for item in script.scenes]
++                data = script.model_dump()
++                data["scenes"] = scenes
++                return Script.model_validate(data)
++            if isinstance(generated, Script) and generated.genre == spec.genre:
++                if (
++                    len(generated.scenes) == count
++                    and sum(map(_words, generated.scenes)) <= limit + 2
++                ):
++                    return generated
++                feedback = (
++                    f"\nMantenha {count} cenas e encurte a fala para até {limit} palavras no total."
++                )
++            else:
++                feedback = "\nA resposta deve usar exatamente o gênero solicitado."
++        except ValidationError as error:
++            first = error.errors(include_input=False, include_url=False, include_context=False)[0]
++            field = ".".join(map(str, first["loc"]))
++            feedback = f"\nRevise o JSON e as referências. Campo inválido: {field or 'roteiro'}."
++    raise StoryError(
++        "O Ollama devolveu um roteiro inválido duas vezes. Simplifique a ideia e tente de novo."
++    )
++
++
++def _words(scene: Scene) -> int:
++    return len(scene.narration.split()) + sum(len(line.text.split()) for line in scene.dialogues)
+diff --git a/frontend/src/index.css b/frontend/src/index.css
+--- a/frontend/src/index.css
++++ b/frontend/src/index.css
+@@ -224,6 +224,32 @@
+   }
+   .preview-stage { background: #242836; color: #f5f6fc; }
+   .preview-stage .btn { color: inherit; }
++  .story-monitor {
++    display: grid;
++    justify-items: center;
++    padding: .8rem;
++    border-radius: .75rem;
++    background: var(--color-ink-850);
++  }
++  .story-video {
++    display: block;
++    aspect-ratio: 9 / 16;
++    width: min(100%, 14rem);
++    border-radius: .6rem;
++    background: #434261;
++    box-shadow: 0 3px 15px #1a143342;
++    object-fit: contain;
++  }
++  .story-progress { width: 100%; height: .5rem; accent-color: var(--color-sodium-500); }
++  .story-step-mark {
++    display: grid;
++    place-items: center;
++    flex-shrink: 0;
++    width: 1.25rem;
++    height: 1.25rem;
++    border-radius: 50%;
++    background: var(--color-ink-850);
++  }
+ }
+ 
+ @media (min-width: 61rem) {
+diff --git a/frontend/src/instagram.ts b/frontend/src/instagram.ts
+--- a/frontend/src/instagram.ts
++++ b/frontend/src/instagram.ts
+@@ -23,6 +23,7 @@
+   title: string
+   size_bytes: number
+   created_at: string
++  kind?: 'story'
+ }
+ 
+ export const REEL_STATUS = {
+diff --git a/frontend/src/pages/Instagram.tsx b/frontend/src/pages/Instagram.tsx
+--- a/frontend/src/pages/Instagram.tsx
++++ b/frontend/src/pages/Instagram.tsx
+@@ -153,7 +153,7 @@
+       <div className="page-heading flex flex-wrap items-end justify-between gap-4">
+         <div>
+           <h1 className="page-title">Instagram</h1>
+-          <p className="mt-2 text-sm text-ink-500">Conecte suas contas profissionais e agende Reels a partir dos cortes exportados.</p>
++          <p className="mt-2 text-sm text-ink-500">Conecte suas contas profissionais e prepare Reels de cortes e histórias exportadas.</p>
+         </div>
+         {status && (
+           <span className={`status-pill ${status.publishing_enabled ? 'text-signal-good' : 'text-ink-400'}`}>
+@@ -265,12 +265,12 @@
+           {exports.length > 0 ? (
+             <div className="mt-3 flex flex-wrap items-end gap-3">
+               <label className="min-w-0 flex-1 basis-64 text-sm font-semibold">
+-                Corte exportado em 9:16
++                Vídeo exportado em 9:16
+                 <select className="field mt-1" value={exportId} onChange={(e) => setExportId(e.target.value)}>
+                   <option value="">Selecione um MP4</option>
+                   {exports.map((item) => (
+                     <option key={item.id} value={item.id}>
+-                      {item.title || 'Corte sem título'} · {formatBytes(item.size_bytes)} · {new Date(item.created_at).toLocaleString('pt-BR')}
++                      {item.kind === 'story' ? 'História · ' : ''}{item.title || 'Corte sem título'} · {formatBytes(item.size_bytes)} · {new Date(item.created_at).toLocaleString('pt-BR')}
+                     </option>
+                   ))}
+                 </select>
+@@ -282,13 +282,15 @@
+             </div>
+           ) : (
+             <p className="mt-3 text-sm text-ink-500">
+-              Exporte um corte vertical pelo <Link className="text-sodium-500 underline" to="/">Clipador</Link> para começar.
++              Exporte um MP4 em <Link className="text-sodium-500 underline" to="/historias">Histórias IA</Link> ou no <Link className="text-sodium-500 underline" to="/">Clipador</Link>.
+             </p>
+           )}
+         </section>
+ 
+         {editor && (
+           <DraftEditor key={editor.id} draft={editor} accounts={usable} busy={busy}
++            suggestedAccount={exports.some((item) => item.id === editor.export_id && item.kind === 'story')
++              ? usable.find((account) => account.username.toLowerCase() === 'clipshistoricos')?.id : undefined}
+             configured={!!status?.configured} onClose={() => setEditor(null)}
+             onSave={(data, checks) => void perform(async () => {
+               if (checks) await instagram.approve(editor.id, data, checks)
+@@ -418,8 +420,9 @@
+ type Edit = Parameters<typeof instagram.save>[1]
+ type Checks = Parameters<typeof instagram.approve>[2]
+ 
+-function DraftEditor({ draft, accounts, configured, busy, onClose, onSave }: {
++function DraftEditor({ draft, accounts, suggestedAccount, configured, busy, onClose, onSave }: {
+   draft: Reel; accounts: InstagramAccount[]; configured: boolean; busy: boolean
++  suggestedAccount?: string
+   onClose: () => void; onSave: (data: Edit, checks?: Checks) => void
+ }) {
+   const [account, setAccount] = useState(draft.account_id ?? '')
+@@ -463,6 +466,12 @@
+               {accounts.map((item) => <option key={item.id} value={item.id}>@{item.username}</option>)}
+             </select>
+           </label>
++          {!account && suggestedAccount && (
++            <button type="button" className="btn btn-ghost justify-self-start" disabled={busy}
++              onClick={() => { setAccount(suggestedAccount); setAuthorized(false) }}>
++              Usar @clipshistoricos
++            </button>
++          )}
+           <label className="text-sm font-semibold">
+             Legenda
+             <textarea className="field mt-1 min-h-24" maxLength={2200} value={caption}
+diff --git a/frontend/src/pages/Stories.tsx b/frontend/src/pages/Stories.tsx
+--- a/frontend/src/pages/Stories.tsx
++++ b/frontend/src/pages/Stories.tsx
+@@ -1,22 +1,369 @@
+-import { Link } from 'react-router-dom'
+-
++import { useCallback, useEffect, useState } from 'react'
++import { Link, useSearchParams } from 'react-router-dom'
++
++import { formatBytes } from '../api'
++import { ErrorNote } from '../components/ErrorNote'
+ import { Icon } from '../components/Icon'
++import {
++  GENRES, STAGES, STATUS, stories,
++  type Script, type StoryOptions, type StoryProject, type StorySpec, type StorySummary,
++} from '../stories'
++import { Duration, Editor, Select, Voice } from './story/Editor'
++
++const INITIAL: StorySpec = {
++  idea: '', genre: 'misterio', seconds: 15, model: 'qwen3:4b-instruct',
++  style: 'cartoon-2d', language: 'pt-BR', voice: '', speed: 1,
++}
++const STEPS = Object.entries(STAGES)
++
++function Production({ project, busy, onCancel, onResume }: {
++  project: StoryProject; busy: boolean; onCancel: () => void; onResume: () => void
++}) {
++  const rendering = project.task?.kind === 'render'
++  const active = project.status === 'gerando'
++  const step = project.stage === 'aguardando' ? 'Aguardando o processador do Studio'
++    : project.stage ? STAGES[project.stage] : 'Aguardando roteiro'
++  const position = STEPS.findIndex(([key]) => key === project.stage)
++  const steps = rendering ? STEPS : STEPS.filter(([key]) => key === project.stage)
++  return (
++    <section className="panel p-4 sm:p-5" aria-labelledby="production-title">
++      <div className="flex flex-wrap items-center justify-between gap-2">
++        <h2 className="panel-title" id="production-title">Produção</h2>
++        <span className={'status-pill ' + (project.status === 'finalizado' ? 'text-signal-good' : 'text-ink-400')}>
++          {STATUS[project.status]}
++        </span>
++      </div>
++      {active && (
++        <div className="mt-3 grid gap-2" role="status">
++          <p className="font-semibold">{step}</p>
++          {project.detail && <p className="break-words text-sm text-ink-500">{project.detail}</p>}
++          {project.total > 0 && <progress className="story-progress" value={project.completed} max={project.total}
++            aria-label={step} />}
++        </div>
++      )}
++      {steps.length > 0 && (
++        <ol className="mt-4 grid gap-2">
++          {steps.map(([key, title]) => {
++            const index = STEPS.findIndex(([name]) => name === key)
++            const done = key === 'roteiro' && !!project.script || index < position || project.status === 'finalizado'
++            const current = active && key === project.stage
++            return (
++              <li key={key} className={'flex items-center gap-2.5 text-sm ' + (current ? 'font-bold text-sodium-500' : 'text-ink-500')}
++                aria-current={current ? 'step' : undefined}>
++                <span className={'story-step-mark ' + (done ? 'text-signal-good' : '')} aria-hidden="true">
++                  {done ? <Icon name="check" width="15" height="15" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" />}
++                </span>
++                {title}
++              </li>
++            )
++          })}
++        </ol>
++      )}
++      {project.error && (
++        <div className="mt-4 rounded-lg border border-ink-800 bg-ink-900 p-3 text-sm" role="alert">
++          <p className="font-semibold text-signal-bad">Diagnóstico{project.stage ? ' · ' + step : ''}</p>
++          <p className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap break-words text-ink-400">{project.error}</p>
++        </div>
++      )}
++      {active && <button type="button" className="btn btn-ghost mt-4" disabled={busy} onClick={onCancel}>Cancelar geração</button>}
++      {!active && project.task && ['cancelado', 'falhou', 'interrompido'].includes(project.status) && (
++        <button type="button" className="btn btn-ghost mt-4" disabled={busy} onClick={onResume}>Retomar produção</button>
++      )}
++    </section>
++  )
++}
++
++function Result({ project, options, canGenerate, canNarrate, onRender, onAudio }: {
++  project: StoryProject | null; options: StoryOptions | null; canGenerate: boolean; canNarrate: boolean
++  onRender: () => void; onAudio: (refresh: boolean) => void
++}) {
++  const exported = project?.export
++  return (
++    <section className="panel min-w-0 p-4 sm:p-5" aria-labelledby="result-title">
++      <div className="flex flex-wrap items-center justify-between gap-2">
++        <h2 id="result-title" className="panel-title">{exported ? 'Resultado' : 'Prévia do estilo'}</h2>
++        <span className="text-xs font-semibold text-ink-500">{options?.width ?? 720} × {options?.height ?? 1280}</span>
++      </div>
++      <div className="story-monitor mt-3">
++        {exported ? (
++          <video key={exported.id} className="story-video" src={stories.video(exported.id)} controls playsInline preload="metadata"
++            aria-label={'Prévia de ' + exported.title} />
++        ) : (
++          <img className="story-video" src={stories.stylePreview} alt="Exemplo de cartoon 2D com um coelho e uma coruja em um jardim noturno" />
++        )}
++      </div>
++      {exported && (
++        <div className="mt-4">
++          <h3 className="break-words text-base font-bold">{exported.title}</h3>
++          <p className="mt-1 text-sm text-ink-500">
++            {exported.duration.toLocaleString('pt-BR', { maximumFractionDigits: 2 })} s · {exported.width} × {exported.height} · {formatBytes(exported.size_bytes)}
++          </p>
++          <div className="mt-3 flex flex-wrap gap-2">
++            <a className="btn btn-primary" href={stories.video(exported.id, true)}>Baixar MP4</a>
++            <Link className="btn btn-ghost" to={'/instagram?export=' + encodeURIComponent(exported.id)}>
++              <Icon name="instagram" width="16" height="16" /> Preparar Reel
++            </Link>
++            <a className="btn btn-quiet" href={stories.captions(exported.id)}>Baixar legendas</a>
++          </div>
++        </div>
++      )}
++      {project?.script && (
++        <div className="mt-4 grid gap-3 border-t border-ink-800 pt-4">
++          <label className="grid gap-1.5 text-sm font-semibold">
++            Legendas
++            <select className="field font-normal" defaultValue="frase">
++              <option value="frase">Por frase</option>
++              <option value="palavra" disabled={!options?.word_captions}>Por palavra · alinhamento indisponível</option>
++            </select>
++          </label>
++          {project.audio_id && (
++            <audio key={project.audio_id} src={stories.audio(project.id, project.audio_id)} controls preload="metadata"
++              aria-label="Prévia da narração" className="w-full" />
++          )}
++          <div className="flex flex-wrap gap-2">
++            <button type="button" className="btn btn-ghost" disabled={!canNarrate} onClick={() => onAudio(!!project.audio_id)}>
++              {project.audio_id ? 'Regenerar narração' : 'Gerar prévia da narração'}
++            </button>
++            <button type="button" className="btn btn-primary" disabled={!canGenerate} onClick={onRender}>
++              <Icon name="film" width="16" height="16" /> {exported ? 'Regenerar vídeo' : 'Produzir vídeo'}
++            </button>
++          </div>
++        </div>
++      )}
++    </section>
++  )
++}
+ 
+ export function Stories() {
++  const [params, setParams] = useSearchParams()
++  const selected = params.get('projeto') ?? ''
++  const [options, setOptions] = useState<StoryOptions | null>(null)
++  const [projects, setProjects] = useState<StorySummary[]>([])
++  const [project, setProject] = useState<StoryProject | null>(null)
++  const [form, setForm] = useState<StorySpec>(INITIAL)
++  const [spec, setSpec] = useState<StorySpec>(INITIAL)
++  const [script, setScript] = useState<Script | null>(null)
++  const [dirty, setDirty] = useState(false)
++  const [busy, setBusy] = useState(false)
++  const [loading, setLoading] = useState(false)
++  const [error, setError] = useState<Error | null>(null)
++
++  const accept = useCallback((record: StoryProject) => {
++    setProject(record)
++    setSpec(record.spec)
++    setScript(record.script)
++    setDirty(false)
++  }, [])
++
++  const refreshOptions = useCallback(async () => {
++    const next = await stories.options()
++    setOptions(next)
++    setForm((draft) => ({
++      ...draft,
++      model: next.models.includes(draft.model) ? draft.model : next.models[0] ?? draft.model,
++      voice: next.voices.includes(draft.voice) ? draft.voice : next.voices[0] ?? '',
++    }))
++  }, [])
++
++  useEffect(() => {
++    void refreshOptions().catch((err: Error) => setError(err))
++    void stories.list().then(setProjects).catch((err: Error) => setError(err))
++  }, [refreshOptions])
++
++  useEffect(() => {
++    setProject(null)
++    setScript(null)
++    if (!selected) {
++      setLoading(false)
++      return
++    }
++    let active = true
++    setLoading(true)
++    void stories.get(selected).then((row) => {
++      if (active) accept(row)
++    }).catch((err: Error) => { if (active) setError(err) }).finally(() => { if (active) setLoading(false) })
++    return () => { active = false }
++  }, [accept, selected])
++
++  const working = project?.id === selected && project.status === 'gerando'
++  useEffect(() => {
++    if (!working) return
++    let disposed = false
++    let timer: number
++    async function poll() {
++      try {
++        const next = await stories.get(selected)
++        if (disposed) return
++        if (next.status !== 'gerando') {
++          accept(next)
++          void stories.list().then(setProjects).catch((err: Error) => setError(err))
++          return
++        }
++        setProject(next)
++      } catch (err) {
++        if (!disposed) setError(err as Error)
++      }
++      if (!disposed) timer = window.setTimeout(poll, 1000)
++    }
++    timer = window.setTimeout(poll, 500)
++    return () => { disposed = true; window.clearTimeout(timer) }
++  }, [accept, selected, working])
++
++  const otherWorking = projects.some((item) => item.id !== selected && item.status === 'gerando')
++  useEffect(() => {
++    if (!otherWorking) return
++    const timer = window.setInterval(() => { void stories.list().then(setProjects).catch(() => undefined) }, 2500)
++    return () => window.clearInterval(timer)
++  }, [otherWorking])
++
++  async function perform(fn: () => Promise<void>) {
++    setError(null)
++    setBusy(true)
++    try {
++      await fn()
++    } catch (err) {
++      setError(err as Error)
++    } finally {
++      setBusy(false)
++      void stories.list().then(setProjects).catch(() => undefined)
++    }
++  }
++
++  const goTo = (id: string) => {
++    setError(null)
++    setParams(id ? { projeto: id } : {})
++  }
++  async function create() {
++    const row = await stories.create(form)
++    try {
++      await stories.task(row.id, { kind: 'roteiro' })
++    } finally {
++      goTo(row.id)
++    }
++  }
++  async function save() {
++    if (project && script && dirty) accept(await stories.save(project.id, spec, script))
++  }
++  const hasVoice = !!options?.voices.includes(spec.voice)
++  const productionAvailable = !busy && !working && !otherWorking
++  const production = project && <Production project={project} busy={busy || otherWorking}
++    onCancel={() => void perform(() => stories.cancel(project.id))}
++    onResume={() => void perform(async () => { accept(await stories.resume(project.id)) })} />
++
+   return (
+-    <div className="mx-auto max-w-4xl">
+-      <div className="page-heading">
+-        <h1 className="page-title">Histórias IA</h1>
+-        <p className="mt-2 text-sm text-ink-500">Produção de histórias em estilo cartoon 2D.</p>
++    <div className="mx-auto max-w-6xl">
++      <header className="page-heading flex flex-wrap items-end justify-between gap-4">
++        <div>
++          <h1 className="page-title">Histórias IA</h1>
++          <p className="mt-2 max-w-prose text-sm text-ink-500">Crie, narre e anime uma história original em vídeo vertical.</p>
++        </div>
++        <div className="flex flex-wrap items-end gap-2">
++          {projects.length > 0 && (
++            <label className="grid min-w-0 gap-1 text-xs font-semibold text-ink-500">
++              Projetos locais
++              <select className="field max-w-[min(73vw,17rem)] text-sm font-normal" value={selected} disabled={busy}
++                onChange={(e) => goTo(e.target.value)}>
++                <option value="">Nova história</option>
++                {projects.map((item) => <option key={item.id} value={item.id}>{item.title.slice(0, 55)} · {STATUS[item.status]}</option>)}
++              </select>
++            </label>
++          )}
++          {selected && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => goTo('')}>
++            <Icon name="plus" width="16" height="16" /> Nova história
++          </button>}
++        </div>
++      </header>
++
++      {error && <div className="mb-4"><ErrorNote error={error} onDismiss={() => setError(null)} /></div>}
++      <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(17rem,1fr)]">
++        <div className="grid min-w-0 gap-4">
++          {loading ? (
++            <p className="panel p-5 text-sm text-ink-500" role="status">Abrindo projeto…</p>
++          ) : project && script ? (
++            <Editor key={project.id} project={project} script={script} spec={spec} options={options}
++              disabled={busy || working} dirty={dirty}
++              onScript={(value) => { setScript(value); setDirty(true) }}
++              onSpec={(value) => { setSpec(value); setDirty(true) }}
++              onSave={() => void perform(save)}
++              onApprove={() => void perform(async () => { await save(); accept(await stories.approve(project.id)) })}
++              onScene={(scene) => {
++                if (!productionAvailable) return
++                void perform(async () => { await save(); accept(await stories.task(project.id, { kind: 'cena', scene })) })
++              }} />
++          ) : project ? (
++            <section className="panel p-4 sm:p-6">
++              <h2 className="panel-title">Ideia da história</h2>
++              <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-relaxed text-ink-400">{project.spec.idea}</p>
++              {project.status === 'rascunho' && <button type="button" className="btn btn-primary mt-4" disabled={!productionAvailable}
++                onClick={() => void perform(async () => accept(await stories.task(project.id, { kind: 'roteiro' })))}>
++                Gerar roteiro
++              </button>}
++            </section>
++          ) : (
++            <section className="panel p-4 sm:p-6" aria-labelledby="create-title">
++              <h2 id="create-title" className="panel-title">Criar história</h2>
++              <form className="mt-5 grid gap-4" onSubmit={(e) => { e.preventDefault(); if (productionAvailable) void perform(create) }}>
++                <label className="grid gap-1.5 text-sm font-semibold">
++                  Ideia da história
++                  <textarea className="field min-h-32 resize-y font-normal" required minLength={4} maxLength={1200}
++                    placeholder="Uma coruja de óculos acha uma chave no jardim de noite…" value={form.idea}
++                    onChange={(e) => setForm({ ...form, idea: e.target.value })} />
++                </label>
++                <div className="grid gap-3 sm:grid-cols-2">
++                  <Select label="Gênero" value={form.genre} values={GENRES} onChange={(genre) => setForm({ ...form, genre })} />
++                  <Duration value={form.seconds} onChange={(seconds) => setForm({ ...form, seconds })} />
++                  <Select label="Estilo visual" value={form.style} values={{ 'cartoon-2d': 'Cartoon 2D minimalista' }}
++                    onChange={(style) => setForm({ ...form, style })} />
++                  <Select label="Idioma" value={form.language} values={{ 'pt-BR': 'Português brasileiro' }}
++                    onChange={(language) => setForm({ ...form, language })} />
++                  <Voice value={form.voice} options={options} onChange={(voice) => setForm({ ...form, voice })} />
++                  <label className="grid gap-1.5 text-sm font-semibold">
++                    Modelo do Ollama
++                    <select className="field font-normal" value={options?.models.includes(form.model) ? form.model : ''}
++                      onChange={(e) => setForm({ ...form, model: e.target.value })}>
++                      {!options?.models.length && <option value="">Nenhum modelo disponível</option>}
++                      {options?.models.map((model) => <option key={model} value={model}>{model}</option>)}
++                    </select>
++                  </label>
++                </div>
++                <button type="submit" className="btn btn-primary justify-self-start"
++                  disabled={!productionAvailable || form.idea.trim().length < 4 || !options?.models.length}>
++                  <Icon name="stories" width="17" height="17" /> Gerar roteiro
++                </button>
++              </form>
++            </section>
++          )}
++
++          {otherWorking && <p role="status" className="rounded-lg border border-ink-800 bg-ink-850 p-3 text-sm text-ink-500">Há outro projeto em produção.</p>}
++          {options && (options.ollama_problem || !options.voices.length) && (
++            <section className="panel p-4 sm:p-5" aria-label="Configuração dos serviços locais">
++              {options.ollama_problem && <p className="text-sm text-ink-400">{options.ollama_problem}</p>}
++              {!options.voices.length && (
++                <p className="mt-1 text-sm text-ink-400">
++                  {options.piper_installed ? 'Nenhuma voz pt-BR encontrada.' : 'Piper ainda não está instalado.'}{' '}
++                  No PowerShell do projeto, execute <code className="break-all">.\scripts\preparar-voz-historias.ps1</code>.
++                </p>
++              )}
++              <button type="button" className="btn btn-ghost mt-3" disabled={busy} onClick={() => void perform(refreshOptions)}>Verificar novamente</button>
++            </section>
++          )}
++        </div>
++        <div className={'grid min-w-0 gap-4 ' + (working ? 'order-first xl:order-none' : '')}>
++          {working && production}
++          <Result project={project} options={options}
++            canNarrate={productionAvailable && hasVoice}
++            canGenerate={productionAvailable && hasVoice && !!project?.approved && !dirty}
++            onAudio={(refresh) => {
++              if (!project) return
++              void perform(async () => { await save(); accept(await stories.task(project.id, { kind: 'audio', refresh })) })
++            }}
++            onRender={() => {
++              if (!project) return
++              void perform(async () => { accept(await stories.task(project.id, { kind: 'render' })) })
++            }} />
++          {!working && production}
++        </div>
+       </div>
+-      <section className="panel p-6">
+-        <span className="icon-tile"><Icon name="stories" /></span>
+-        <h2 className="panel-title mt-4">Módulo em preparação</h2>
+-        <p className="mt-2 max-w-prose text-sm leading-relaxed text-ink-500">
+-          O fluxo previsto parte de um prompt para criar roteiro, imagens, narração, legendas e animações simples.
+-        </p>
+-        <Link to="/" className="btn btn-ghost mt-5">Voltar ao painel</Link>
+-      </section>
+     </div>
+   )
+ }
+diff --git a/frontend/src/pages/story/Editor.tsx b/frontend/src/pages/story/Editor.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/pages/story/Editor.tsx
+@@ -0,0 +1,235 @@
++import { useState } from 'react'
++
++import { Icon } from '../../components/Icon'
++import {
++  ACCESSORIES, DURATION, LIGHT, MOODS, MOTIONS, PROPS, SETTINGS, SHOTS, SPECIES, stories, voiceName,
++  type Character, type Scene, type Script, type StoryOptions, type StoryProject, type StorySpec,
++} from '../../stories'
++
++export function Select<K extends string>({ label, value, values, onChange }: {
++  label: string
++  value: K
++  values: Record<K, string>
++  onChange: (value: K) => void
++}) {
++  return (
++    <label className="grid gap-1.5 text-sm font-semibold">
++      {label}
++      <select className="field font-normal" value={value} onChange={(e) => onChange(e.target.value as K)}>
++        {Object.entries(values).map(([key, title]) => <option key={key} value={key}>{title as string}</option>)}
++      </select>
++    </label>
++  )
++}
++
++export function Duration({ value, onChange }: { value: StorySpec['seconds']; onChange: (value: StorySpec['seconds']) => void }) {
++  return (
++    <label className="grid gap-1.5 text-sm font-semibold">
++      Duração
++      <select className="field font-normal" value={value} onChange={(e) => onChange(Number(e.target.value) as StorySpec['seconds'])}>
++        {DURATION.map((item) => <option key={item} value={item}>{item} segundos</option>)}
++      </select>
++    </label>
++  )
++}
++
++export function Voice({ value, options, onChange }: {
++  value: string; options: StoryOptions | null; onChange: (value: string) => void
++}) {
++  const available = options?.voices ?? []
++  return (
++    <label className="grid gap-1.5 text-sm font-semibold">
++      Narrador
++      <select className="field font-normal" value={value} onChange={(e) => onChange(e.target.value)}>
++        <option value="">Escolha uma voz pt-BR</option>
++        {value && !available.includes(value) && <option value={value} disabled>{voiceName(value)} indisponível</option>}
++        {available.map((voice) => <option key={voice} value={voice}>{voiceName(voice)}</option>)}
++      </select>
++    </label>
++  )
++}
++
++const colors = ['#d69879', '#b3a2d0', '#e8bf78', '#82baa9', '#729cc1', '#e29cae']
++
++function CharacterCard({ character, project, onChange }: {
++  character: Character; project: StoryProject; onChange: (character: Character) => void
++}) {
++  const saved = project.script?.characters.find((item) => item.id === character.id)
++  const previewPending = saved && (saved.color !== character.color || saved.accessory !== character.accessory || saved.species !== character.species)
++  const change = (patch: Partial<Character>) => onChange({ ...character, ...patch })
++  return (
++    <article className="grid gap-3 rounded-xl border border-ink-800 p-3 sm:grid-cols-[7rem_minmax(0,1fr)]">
++      <div className="grid place-items-center self-start overflow-hidden rounded-lg bg-ink-850">
++        <img className="aspect-square w-full max-w-36 object-contain" src={stories.reference(project.id, character.id, project.updated_at)}
++          alt={'Ficha visual salva de ' + character.name} loading="lazy" />
++        {previewPending && <p className="p-2 text-center text-xs text-ink-500">Salve para atualizar a ficha.</p>}
++      </div>
++      <div className="grid gap-3">
++        <div className="grid gap-3 sm:grid-cols-2">
++          <label className="grid gap-1.5 text-sm font-semibold">
++            Nome
++            <input className="field font-normal" maxLength={100} value={character.name} onChange={(e) => change({ name: e.target.value })} />
++          </label>
++          <Select label="Personagem da biblioteca" values={SPECIES} value={character.species} onChange={(species) => change({ species })} />
++          <Select label="Acessório" values={ACCESSORIES} value={character.accessory} onChange={(accessory) => change({ accessory })} />
++          <label className="grid gap-1.5 text-sm font-semibold">
++            Cor
++            <input type="color" className="field h-[2.6rem] cursor-pointer py-1.5" value={character.color}
++              onChange={(e) => change({ color: e.target.value })} />
++          </label>
++        </div>
++        <label className="grid gap-1.5 text-sm font-semibold">
++          Descrição visual
++          <input className="field font-normal" maxLength={100} value={character.visual} onChange={(e) => change({ visual: e.target.value })} />
++        </label>
++        <button type="button" className="btn btn-ghost justify-self-start" onClick={() => {
++          const index = colors.indexOf(character.color.toLowerCase())
++          change({ color: colors[(index + 1) % colors.length] })
++        }}>Variar visual</button>
++      </div>
++    </article>
++  )
++}
++
++function SceneFields({ scene, script, onChange }: { scene: Scene; script: Script; onChange: (scene: Scene) => void }) {
++  const change = (patch: Partial<Scene>) => onChange({ ...scene, ...patch })
++  return (
++    <div className="grid gap-3 rounded-xl border border-ink-800 p-3 sm:p-4">
++      <label className="grid gap-1.5 text-sm font-semibold">
++        Título da cena
++        <input className="field font-normal" maxLength={100} value={scene.title} onChange={(e) => change({ title: e.target.value })} />
++      </label>
++      <label className="grid gap-1.5 text-sm font-semibold">
++        Narração
++        <textarea className="field min-h-20 resize-y font-normal" maxLength={400} value={scene.narration}
++          onChange={(e) => change({ narration: e.target.value })} />
++      </label>
++      <label className="grid gap-1.5 text-sm font-semibold">
++        Ação visual
++        <textarea className="field min-h-18 resize-y font-normal" maxLength={400} value={scene.action}
++          onChange={(e) => change({ action: e.target.value })} />
++      </label>
++      <div className="grid gap-3 sm:grid-cols-2">
++        <Select label="Cenário" values={SETTINGS} value={scene.setting} onChange={(setting) => change({ setting })} />
++        <Select label="Luz" values={LIGHT} value={scene.light} onChange={(light) => change({ light })} />
++        <Select label="Expressão" values={MOODS} value={scene.mood} onChange={(mood) => change({ mood })} />
++        <Select label="Movimento" values={MOTIONS} value={scene.motion} onChange={(motion) => change({ motion })} />
++        <Select label="Objeto em cena" values={PROPS} value={scene.prop} onChange={(prop) => change({ prop })} />
++        <Select label="Enquadramento" values={SHOTS} value={scene.shot} onChange={(shot) => change({ shot })} />
++      </div>
++      <div className="flex flex-wrap items-center gap-3 text-sm">
++        <span className="font-semibold">Em cena</span>
++        {script.characters.map((character) => {
++          const included = scene.characters.includes(character.id)
++          return (
++            <label key={character.id} className="flex items-center gap-1.5">
++              <input type="checkbox" className="accent-sodium-500" checked={included}
++                disabled={included ? scene.characters.length === 1 : scene.characters.length === 2}
++                onChange={(e) => {
++                  const characters = e.target.checked ? [...scene.characters, character.id] : scene.characters.filter((id) => id !== character.id)
++                  change({ characters, dialogues: scene.dialogues.filter((line) => characters.includes(line.speaker)) })
++                }} />
++              {character.name}
++            </label>
++          )
++        })}
++      </div>
++      <details className="rounded-lg bg-ink-900 p-3 text-sm">
++        <summary className="cursor-pointer font-semibold">Diálogos{scene.dialogues.length ? ' · ' + scene.dialogues.length : ''}</summary>
++        {scene.dialogues.map((line, index) => (
++          <div key={index} className="mt-3 grid gap-2 sm:grid-cols-[8rem_minmax(0,1fr)_auto]">
++            <Select label="Quem fala" value={line.speaker}
++              values={Object.fromEntries(script.characters.filter((item) => scene.characters.includes(item.id)).map((item) => [item.id, item.name]))}
++              onChange={(speaker) => change({ dialogues: scene.dialogues.map((item, i) => i === index ? { ...item, speaker } : item) })} />
++            <label className="grid gap-1.5 text-sm font-semibold">
++              Fala
++              <input className="field font-normal" maxLength={400} value={line.text}
++                onChange={(e) => change({ dialogues: scene.dialogues.map((item, i) => i === index ? { ...item, text: e.target.value } : item) })} />
++            </label>
++            <button type="button" className="btn btn-quiet self-end" onClick={() => change({ dialogues: scene.dialogues.filter((_, i) => i !== index) })}>Remover</button>
++          </div>
++        ))}
++        {scene.dialogues.length < 2 && <button type="button" className="btn btn-quiet mt-2" onClick={() =>
++          change({ dialogues: [...scene.dialogues, { speaker: scene.characters[0], text: '' }] })}>Adicionar fala</button>}
++      </details>
++    </div>
++  )
++}
++
++export function Editor({ project, spec, script, options, disabled, dirty, onSpec, onScript, onSave, onApprove, onScene }: {
++  project: StoryProject; spec: StorySpec; script: Script; options: StoryOptions | null
++  disabled: boolean; dirty: boolean
++  onSpec: (spec: StorySpec) => void; onScript: (script: Script) => void
++  onSave: () => void; onApprove: () => void; onScene: (scene: string) => void
++}) {
++  const [selected, setSelected] = useState(script.scenes[0]?.id)
++  const scene = script.scenes.find((item) => item.id === selected) ?? script.scenes[0]
++  return (
++    <section className="panel min-w-0 p-4 sm:p-6" aria-labelledby="script-title">
++      <div className="flex flex-wrap items-center justify-between gap-2">
++        <h2 className="panel-title" id="script-title">Editor de roteiro</h2>
++        <span className={'status-pill ' + (project.approved && !dirty ? 'text-signal-good' : 'text-ink-500')}>
++          {dirty ? 'Alterações pendentes' : project.approved ? 'Roteiro aprovado' : 'Aguardando revisão'}
++        </span>
++      </div>
++      <fieldset disabled={disabled} className="mt-5 grid min-w-0 gap-4">
++        <label className="grid gap-1.5 text-sm font-semibold">
++          Título
++          <input className="field font-normal" maxLength={100} value={script.title} onChange={(e) => onScript({ ...script, title: e.target.value })} />
++        </label>
++        <label className="grid gap-1.5 text-sm font-semibold">
++          Sinopse
++          <textarea className="field min-h-16 resize-y font-normal" maxLength={400} value={script.synopsis}
++            onChange={(e) => onScript({ ...script, synopsis: e.target.value })} />
++        </label>
++        <div className="grid gap-3 sm:grid-cols-3">
++          <Duration value={spec.seconds} onChange={(seconds) => onSpec({ ...spec, seconds })} />
++          <Voice value={spec.voice} options={options} onChange={(voice) => onSpec({ ...spec, voice })} />
++          <label className="grid gap-1.5 text-sm font-semibold">
++            Velocidade do narrador
++            <select className="field font-normal" value={spec.speed} onChange={(e) => onSpec({ ...spec, speed: Number(e.target.value) })}>
++              {[...new Set([0.8, 0.9, 1, 1.05, 1.15, 1.25, spec.speed])].sort().map((speed) =>
++                <option key={speed} value={speed}>{speed.toLocaleString('pt-BR')}×</option>)}
++            </select>
++          </label>
++        </div>
++        <details className="rounded-xl border border-ink-800 p-3 sm:p-4">
++          <summary className="cursor-pointer text-sm font-semibold">Personagens · {script.characters.length}</summary>
++          <div className="mt-3 grid gap-3">
++            {script.characters.map((character) => <CharacterCard key={character.id} project={project} character={character}
++              onChange={(updated) => onScript({ ...script, characters: script.characters.map((item) => item.id === updated.id ? updated : item) })} />)}
++          </div>
++        </details>
++        <div>
++          <h3 className="text-sm font-bold">Cenas</h3>
++          <div className="mt-2 flex flex-wrap gap-2">
++            {script.scenes.map((item, index) => (
++              <button type="button" key={item.id} aria-pressed={item.id === scene.id}
++                className={'btn ' + (item.id === scene.id ? 'btn-primary' : 'btn-ghost')} onClick={() => setSelected(item.id)}>
++                Cena {index + 1}
++              </button>
++            ))}
++          </div>
++          <div className="mt-3">
++            <SceneFields key={scene.id} scene={scene} script={script}
++              onChange={(value) => onScript({ ...script, scenes: script.scenes.map((item) => item.id === value.id ? value : item) })} />
++          </div>
++          <button type="button" className="btn btn-ghost mt-3" disabled={!options?.models.includes(spec.model)} onClick={() => onScene(scene.id)}>
++            <Icon name="stories" width="16" height="16" /> Regenerar cena
++          </button>
++        </div>
++        <details className="rounded-xl border border-ink-800 p-3 text-sm">
++          <summary className="cursor-pointer font-semibold">Final da história</summary>
++          <textarea aria-label="Final da história" className="field mt-3 min-h-16 resize-y font-normal" maxLength={400}
++            value={script.ending} onChange={(e) => onScript({ ...script, ending: e.target.value })} />
++        </details>
++        <div className="flex flex-wrap gap-2 border-t border-ink-800 pt-4">
++          <button type="button" className="btn btn-ghost" disabled={!dirty} onClick={onSave}>Salvar alterações</button>
++          <button type="button" className="btn btn-primary" disabled={!dirty && project.approved} onClick={onApprove}>
++            <Icon name="check" width="16" height="16" /> Aprovar roteiro
++          </button>
++        </div>
++      </fieldset>
++    </section>
++  )
++}
+diff --git a/frontend/src/stories.ts b/frontend/src/stories.ts
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/stories.ts
+@@ -0,0 +1,149 @@
++import { request } from './api'
++
++export const GENRES = {
++  misterio: 'Mistério', terror: 'Terror leve', suspense: 'Suspense', humor: 'Humor absurdo',
++  reviravolta: 'Reviravolta', aventura: 'Aventura',
++}
++export const SPECIES = { cachorro: 'Cachorro', gato: 'Gato', coelho: 'Coelho', coruja: 'Coruja', robo: 'Robô' }
++export const SETTINGS = { quarto: 'Quarto', bosque: 'Bosque', jardim: 'Jardim', oficina: 'Oficina', rua: 'Rua' }
++export const LIGHT = { dia: 'Dia', entardecer: 'Entardecer', noite: 'Noite' }
++export const MOODS = { calmo: 'Calma', feliz: 'Alegria', surpreso: 'Surpresa', assustado: 'Medo', curioso: 'Curiosidade', triste: 'Tristeza' }
++export const MOTIONS = { respirar: 'Respirar e piscar', acenar: 'Acenar', balancar_cabeca: 'Balançar a cabeça', entrar: 'Entrar em cena', sair: 'Sair de cena', pular: 'Pular' }
++export const PROPS = { nenhum: 'Nenhum', estrela: 'Estrela', chave: 'Chave', bilhete: 'Bilhete', lanterna: 'Lanterna', livro: 'Livro', semente: 'Semente', bola: 'Bola' }
++export const SHOTS = { medio: 'Plano médio', proximo: 'Plano mais próximo' }
++export const ACCESSORIES = { nenhum: 'Nenhum', lenco: 'Lenço', gravata: 'Gravata', oculos: 'Óculos', broche: 'Broche' }
++export const DURATION = [15, 30, 45, 60] as const
++
++export interface StorySpec {
++  idea: string
++  genre: keyof typeof GENRES
++  seconds: typeof DURATION[number]
++  model: string
++  style: 'cartoon-2d'
++  language: 'pt-BR'
++  voice: string
++  speed: number
++}
++
++export interface Character {
++  id: string
++  name: string
++  species: keyof typeof SPECIES
++  visual: string
++  color: string
++  accessory: keyof typeof ACCESSORIES
++}
++
++export interface Scene {
++  id: string
++  title: string
++  setting: keyof typeof SETTINGS
++  light: keyof typeof LIGHT
++  characters: string[]
++  narration: string
++  dialogues: { speaker: string; text: string }[]
++  action: string
++  mood: keyof typeof MOODS
++  motion: keyof typeof MOTIONS
++  prop: keyof typeof PROPS
++  shot: keyof typeof SHOTS
++  seconds: number
++}
++
++export interface Script {
++  title: string
++  synopsis: string
++  genre: StorySpec['genre']
++  setting: string
++  characters: Character[]
++  scenes: Scene[]
++  ending: string
++}
++
++export interface StoryExport {
++  id: string
++  title: string
++  width: number
++  height: number
++  duration: number
++  size_bytes: number
++  created_at: string
++}
++
++export const STATUS = {
++  rascunho: 'Rascunho', gerando: 'Em produção', finalizado: 'Finalizado',
++  falhou: 'Falhou', cancelado: 'Cancelado', interrompido: 'Interrompido',
++}
++export const STAGES = {
++  roteiro: 'Gerando roteiro', personagens: 'Preparando personagens', cenarios: 'Preparando cenários',
++  narracao: 'Gerando narração', animacao: 'Animando cenas', legendas: 'Inserindo legendas',
++  renderizacao: 'Renderizando vídeo', finalizado: 'Finalizado',
++}
++
++export interface StorySummary {
++  id: string
++  status: keyof typeof STATUS
++  title: string
++  updated_at: string
++}
++
++interface Task {
++  kind: 'roteiro' | 'cena' | 'audio' | 'render'
++  scene?: string
++  refresh?: boolean
++}
++
++export interface StoryProject extends Omit<StorySummary, 'title'> {
++  spec: StorySpec
++  script: Script | null
++  approved: boolean
++  stage: keyof typeof STAGES | 'aguardando' | null
++  completed: number
++  total: number
++  detail: string
++  error: string | null
++  task: Task | null
++  audio_id: string | null
++  export: StoryExport | null
++}
++
++export interface StoryOptions {
++  models: string[]
++  ollama_problem: string | null
++  voices: string[]
++  piper_installed: boolean
++  width: number
++  height: number
++  word_captions: boolean
++}
++
++const prefix = '/api/stories'
++const read = <T>(path: string) => request<T>(prefix + path)
++const write = <T>(path: string, method: string, body?: unknown) => request<T>(prefix + path, {
++  method, headers: { 'X-Studio-Local': '1' }, body: body === undefined ? undefined : JSON.stringify(body),
++})
++const projectPath = (id: string) => '/' + encodeURIComponent(id)
++const exportPath = (id: string) => '/exports/' + encodeURIComponent(id)
++
++export function voiceName(voice: string) {
++  const [name] = voice.replace(/^pt_BR-/, '').split('-')
++  return name ? name[0].toUpperCase() + name.slice(1) + ' · pt-BR' : 'Sem voz'
++}
++
++export const stories = {
++  options: () => read<StoryOptions>('/options'),
++  list: () => read<StorySummary[]>(''),
++  get: (id: string) => read<StoryProject>(projectPath(id)),
++  create: (spec: StorySpec) => write<StoryProject>('', 'POST', spec),
++  save: (id: string, spec: StorySpec, script: Script) => write<StoryProject>(projectPath(id), 'PUT', { spec, script }),
++  approve: (id: string) => write<StoryProject>(projectPath(id) + '/approve', 'POST'),
++  task: (id: string, task: Task) => write<StoryProject>(projectPath(id) + '/tasks', 'POST', task),
++  resume: (id: string) => write<StoryProject>(projectPath(id) + '/resume', 'POST'),
++  cancel: (id: string) => write<void>(projectPath(id) + '/cancel', 'POST'),
++  video: (id: string, download = false) => prefix + exportPath(id) + '/video' + (download ? '?download=true' : ''),
++  captions: (id: string) => prefix + exportPath(id) + '/captions',
++  audio: (id: string, version: string) => prefix + projectPath(id) + '/audio/' + encodeURIComponent(version),
++  reference: (id: string, key: string, version: string) => prefix + projectPath(id) + '/characters/'
++    + encodeURIComponent(key) + '?v=' + encodeURIComponent(version),
++  stylePreview: prefix + '/style-preview',
++}
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -49,6 +49,7 @@
+   # No upper bound: nothing here requires numpy 1.x, and capping it below 2.0
+   # made the diarization extra unsatisfiable, since WhisperX requires >=2.1.
+   "numpy>=1.26",
++  "pillow>=10.4",
+   # Captions
+   "pysubs2>=1.7",
+   # Providers
+diff --git a/tests/test_studio_stories.py b/tests/test_studio_stories.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_studio_stories.py
+@@ -0,0 +1,333 @@
++from __future__ import annotations
++
++import asyncio
++import json
++import shutil
++import threading
++import time
++import wave
++
++import pytest
++from autoclip import paths
++from autoclip.app import create_app
++from autoclip.pipeline import Cancelled, ffmpeg
++from autoclip.stories import art, narration, writer
++from autoclip.stories.schema import Script, StoryError, StorySpec, StoryTask
++from autoclip.stories.store import StoryStore
++from fastapi.testclient import TestClient
++from PIL import Image, ImageChops
++from pydantic import ValidationError
++
++ORIGIN = "http://127.0.0.1:8000"
++LOCAL = {"Origin": ORIGIN, "X-Studio-Local": "1"}
++PREFIX = "/api/stories"
++VOICE = "pt_BR-cadu-medium"
++
++
++@pytest.fixture
++def spec() -> StorySpec:
++    return StorySpec(idea="Uma coruja ajuda um robô a devolver uma estrela.", voice=VOICE)
++
++
++@pytest.fixture
++def script() -> Script:
++    return Script.model_validate(
++        {
++            "title": "A estrela amarela",
++            "synopsis": "Lume e Nina devolvem uma estrela ao céu.",
++            "genre": "misterio",
++            "setting": "Jardim noturno",
++            "ending": "A estrela encontra o seu lugar.",
++            "characters": [
++                {
++                    "id": "c1",
++                    "name": "Lume",
++                    "species": "robo",
++                    "visual": "Verde",
++                    "color": "#82baa9",
++                },
++                {
++                    "id": "c2",
++                    "name": "Nina",
++                    "species": "coruja",
++                    "visual": "Roxa",
++                    "color": "#b3a2d0",
++                },
++            ],
++            "scenes": [
++                {
++                    "id": f"s{i}",
++                    "title": title,
++                    "setting": "jardim",
++                    "light": "noite",
++                    "characters": ["c1", "c2"],
++                    "narration": spoken,
++                    "action": title,
++                    "seconds": 5,
++                    "prop": "estrela",
++                    "mood": "curioso",
++                    "motion": "acenar",
++                }
++                for i, (title, spoken) in enumerate(
++                    [
++                        ("Encontro", "Uma estrela caiu."),
++                        ("Ajuda", "Lume chamou Nina."),
++                        ("Retorno", "Juntos, devolveram a estrela."),
++                    ],
++                    start=1,
++                )
++            ],
++        }
++    )
++
++
++@pytest.fixture
++def client(monkeypatch):
++    monkeypatch.setenv("AUTOCLIP_NO_WORKER", "1")
++    monkeypatch.setenv("AI_SHORTS_INSTAGRAM_PUBLISH", "0")
++    with TestClient(create_app(), base_url=ORIGIN, client=("127.0.0.1", 50080)) as opened:
++        yield opened
++
++
++@pytest.fixture
++def fake_piper(tmp_path, monkeypatch):
++    voice = tmp_path / f"{VOICE}.onnx"
++    voice.write_bytes(b"only used as a cache key")
++    voice.with_suffix(".onnx.json").write_text("{}", encoding="utf-8")
++    monkeypatch.setattr(narration, "available_voices", lambda: {VOICE: voice})
++    calls = []
++
++    def synth(model, speed, fragments, cancelled, progress):
++        assert model == voice
++        if not fragments:
++            return
++        calls.append((speed, list(fragments)))
++        for i, filename in enumerate(fragments.values(), start=1):
++            assert not cancelled()
++            filename.parent.mkdir(parents=True, exist_ok=True)
++            with wave.open(str(filename), "wb") as track:
++                track.setparams((1, 2, 16_000, 0, "NONE", "not compressed"))
++                track.writeframes(b"\x0a\x0b" * 8_000)
++            progress(i)
++
++    monkeypatch.setattr(narration, "synthesize", synth)
++    return voice, calls
++
++
++def post(client, url: str, data=None, expected=200):
++    response = client.post(url, json=data, headers=LOCAL)
++    assert response.status_code == expected, response.text
++    return response.json() if expected != 204 else None
++
++
++def project(client, spec, script=None):
++    record = post(client, PREFIX, spec.model_dump(), expected=201)
++    url = PREFIX + "/" + record["id"]
++    if script is not None:
++        response = client.put(
++            url, json={"script": script.model_dump(), "spec": spec.model_dump()}, headers=LOCAL
++        )
++        assert response.status_code == 200, response.text
++    return url
++
++
++def wait_for(client, url, status, timeout=40):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        row = client.get(url).json()
++        if row["status"] != "gerando":
++            assert row["status"] == status, row
++            return row
++        time.sleep(0.04)
++    pytest.fail("A tarefa de história não deixou a fila.")
++
++
++async def test_validates_ollama_json_and_retries_once(monkeypatch, spec, script):
++    prompts, attempts = [], []
++    bad = script.model_dump()
++    bad["scenes"][0]["characters"] = ["desconhecido"]
++
++    async def generate(_url, payload, _cancelled):
++        prompts.append(payload)
++        return json.dumps(bad) if len(prompts) == 1 else script.model_dump_json()
++
++    monkeypatch.setattr(writer, "_generation", generate)
++    result = await writer.write_story(spec, lambda: False, attempts.append)
++    assert result == script
++    assert attempts == [1, 2]
++    assert prompts[0]["format"]["title"] == "Script"
++    assert prompts[0]["keep_alive"] == 0 and prompts[0]["think"] is False
++    assert "Campo inválido" in prompts[1]["prompt"]
++    with pytest.raises(ValidationError, match="personagem"):
++        Script.model_validate(bad)
++
++
++async def test_invalid_ollama_response_stops_at_two_attempts(monkeypatch, spec):
++    attempts = []
++
++    async def generate(*_args):
++        return "not json"
++
++    monkeypatch.setattr(writer, "_generation", generate)
++    with pytest.raises(StoryError, match="duas vezes"):
++        await writer.write_story(spec, lambda: False, attempts.append)
++    assert attempts == [1, 2]
++
++
++async def test_regenerating_scene_preserves_cast_and_other_scenes(monkeypatch, spec, script):
++    changed = script.scenes[1].model_copy(update={"id": "s9", "narration": "Nina ouviu o chamado."})
++
++    async def generate(_url, payload, _cancelled):
++        assert payload["format"]["title"] == "Scene"
++        return changed.model_dump_json()
++
++    monkeypatch.setattr(writer, "_generation", generate)
++    result = await writer.write_story(spec, lambda: False, lambda _: None, script, "s2")
++    assert result.characters == script.characters
++    assert result.scenes[0] == script.scenes[0] and result.scenes[2] == script.scenes[2]
++    assert result.scenes[1].id == "s2" and result.scenes[1].narration == changed.narration
++
++
++def test_asset_consistency_blinks_and_pose(tmp_path, script):
++    first, second = script.characters
++    calm = art.actor(tmp_path, first, "calmo")
++    curious = art.actor(tmp_path, first, "curioso")
++    assert calm.body.tobytes() == curious.body.tobytes()
++    assert calm.head.tobytes() != curious.head.tobytes()
++    assert calm.sprite().tobytes() != calm.sprite(eyes_closed=True).tobytes()
++    assert calm.sprite().tobytes() != calm.sprite(wave=-28, nod=10).tobytes()
++    previous_reference = art.reference(tmp_path, second)
++    assert art.reference(tmp_path, first) != art.reference(
++        tmp_path, first.model_copy(update={"color": "#e8bf78"})
++    )
++    assert art.reference(tmp_path, second) == previous_reference
++
++
++def test_narration_uses_pcm_times_and_reuses_audio(tmp_path, script, spec, fake_piper):
++    voice, calls = fake_piper
++    track = tmp_path / "track"
++    track.mkdir()
++    args = (script, spec, voice, tmp_path / "cache", track, lambda: False, lambda *_: None)
++    first = narration.make_narration(*args)
++    second = narration.make_narration(*args)
++    assert first == second
++    assert len(calls) == 1
++    assert first.boundaries == [0, 5, 10, 15]
++    assert first.cues[0].start == 0.15
++    assert all(cue.end - cue.start == pytest.approx(0.5) for cue in first.cues)
++    with wave.open(str(track / "narracao.wav"), "rb") as audio:
++        assert audio.getnframes() == 15 * 16_000
++        audio.setpos(round(first.cues[0].start * audio.getframerate()))
++        assert audio.readframes(1) == b"\x0a\x0b"
++    narration.make_narration(*args, refresh=True)
++    assert len(calls) == 2
++
++
++def test_missing_voice_is_actionable_and_local_only(client, monkeypatch, spec, script):
++    monkeypatch.setattr(narration, "available_voices", lambda: {})
++    url = project(client, spec, script)
++    assert client.post(url + "/approve").status_code == 403
++    post(client, url + "/approve")
++    post(client, url + "/tasks", {"kind": "render"}, expected=202)
++    failed = wait_for(client, url, "falhou")
++    assert failed["export"] is None and failed["stage"] == "narracao"
++    assert "preparar-voz-historias.ps1" in failed["error"]
++
++
++def test_single_story_and_cancel_resume(client, monkeypatch, spec, script):
++    first, second = project(client, spec), project(client, spec)
++    entered = threading.Event()
++
++    async def blocked(_spec, cancelled, attempt, *_args):
++        attempt(1)
++        entered.set()
++        while not cancelled():
++            await asyncio.sleep(0.01)
++        raise Cancelled
++
++    monkeypatch.setattr(writer, "write_story", blocked)
++    post(client, first + "/tasks", {"kind": "roteiro"}, expected=202)
++    assert entered.wait(3)
++    post(client, second + "/tasks", {"kind": "roteiro"}, expected=409)
++    post(client, first + "/cancel", expected=204)
++    wait_for(client, first, "cancelado")
++
++    async def success(*_args):
++        return script
++
++    monkeypatch.setattr(writer, "write_story", success)
++    post(client, first + "/resume", expected=202)
++    assert wait_for(client, first, "rascunho")["script"]["title"] == script.title
++
++
++def test_interrupted_state_survives_restart(monkeypatch, spec, script):
++    monkeypatch.setenv("AUTOCLIP_NO_WORKER", "1")
++    store = StoryStore()
++    store.initialize()
++    row = store.create(spec)
++    record = store.begin(row["id"], StoryTask(kind="roteiro"))
++    store.progress(row["id"], record["run_id"], "roteiro", 0, 0, "Roteiro em andamento")
++
++    async def success(*_args):
++        return script
++
++    monkeypatch.setattr(writer, "write_story", success)
++    with TestClient(create_app(), base_url=ORIGIN, client=("127.0.0.1", 50080)) as client:
++        url = PREFIX + "/" + row["id"]
++        assert client.get(url).json()["status"] == "interrompido"
++        post(client, url + "/resume", expected=202)
++        assert wait_for(client, url, "rascunho")["script"]["title"] == script.title
++    assert StoryStore().get(row["id"])["spec"]["idea"] == spec.idea
++
++
++@pytest.mark.slow
++def test_export_real_ffmpeg_captions_and_reel_preview(client, spec, script, fake_piper, tmp_path):
++    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
++        pytest.skip("FFmpeg and FFprobe are required")
++    url = project(client, spec, script)
++    post(client, url + "/tasks", {"kind": "render"}, expected=422)
++    post(client, url + "/approve")
++    post(client, url + "/tasks", {"kind": "audio"}, expected=202)
++    audio = wait_for(client, url, "rascunho")
++    assert client.get(f"{url}/audio/{audio['audio_id']}").status_code == 200
++    post(client, url + "/tasks", {"kind": "render"}, expected=202)
++    ready = wait_for(client, url, "finalizado")
++    video = ready["export"]
++    assert len(fake_piper[1]) == 1
++    saved = StoryStore().export_path(video)
++    assert saved and StoryStore().get(ready["id"])["export"]["id"] == video["id"]
++    info = ffmpeg.probe(saved)
++    assert (info.width, info.height, info.fps, info.video_codec, info.audio_codec) == (
++        720,
++        1280,
++        24,
++        "h264",
++        "aac",
++    )
++    assert info.duration_s == pytest.approx(15, abs=0.05)
++    endpoint = PREFIX + "/exports/" + video["id"]
++    assert client.get(endpoint + "/video", headers={"Range": "bytes=0-99"}).status_code == 206
++    assert "00:00:00,150" in client.get(endpoint + "/captions").text
++    frames = []
++    for position in (".04", ".35"):
++        image = tmp_path / f"frame-{position}.png"
++        ffmpeg.run(["-ss", "0" + position, "-i", str(saved), "-frames:v", "1", str(image)])
++        with Image.open(image) as frame:
++            frames.append(frame.crop((100, 174, 620, 240)).convert("L"))
++    assert ImageChops.difference(*frames).getextrema()[1] > 100
++    assert (
++        client.get("/api/instagram/exports", params={"preferred": video["id"]}).json()[0]["kind"]
++        == "story"
++    )
++    draft = post(client, "/api/instagram/reels", {"export_id": video["id"]}, expected=201)
++    assert draft["status"] == "draft" and draft["account_id"] is None
++    assert not client.get("/api/instagram/status").json()["publishing_enabled"]
++
++    edited = script.model_copy(update={"title": "Outra versão"})
++    response = client.put(
++        url, json={"script": edited.model_dump(), "spec": spec.model_dump()}, headers=LOCAL
++    )
++    assert response.status_code == 200 and not response.json()["approved"]
++    assert saved.is_file()
++    assert client.get(endpoint + "/video").status_code == 200
++    assert paths.root().is_relative_to(tmp_path)

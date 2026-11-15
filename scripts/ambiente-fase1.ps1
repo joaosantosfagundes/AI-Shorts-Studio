@@ -26,6 +26,9 @@ $env:HF_HUB_DISABLE_TELEMETRY = '1'
 $env:OLLAMA_MODELS = Join-Path $fase1Root 'cache/ollama'
 $env:OLLAMA_HOST = '127.0.0.1:11434'
 $env:OLLAMA_NO_CLOUD = '1'
+if (-not $env:AI_SHORTS_STORY_VOICES) {
+    $env:AI_SHORTS_STORY_VOICES = Join-Path $fase1Root 'cache/piper'
+}
 $env:PYTHONUTF8 = '1'
 if (($env:PATH -split ';') -notcontains $ffmpegDir) {
     $env:PATH = "$ffmpegDir;$env:PATH"

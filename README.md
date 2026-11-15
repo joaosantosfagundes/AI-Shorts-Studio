@@ -1,10 +1,10 @@
-# AI Shorts Studio · Clipador IA
+# AI Shorts Studio
 
 O painel abre em tema claro e usa português brasileiro. Use **Tema escuro** para alternar. A preferência é salva no navegador. O Clipador continua usando o AutoClip para analisar, editar e exportar os cortes.
 
 Em **Instagram**, use o Unified Login da Meta para conectar até duas contas profissionais em um portfólio empresarial, sem precisar de Páginas do Facebook. Prepare Reels a partir de MP4 verticais, aprove cada envio e acompanhe a fila e o histórico por conta. A publicação começa pausada. [Configurar Unified Login e HTTPS local no Windows](docs/instagram-meta.md)
 
-**Histórias IA** tem uma página própria para o futuro fluxo de produção em cartoon 2D.
+**Histórias IA** gera roteiros editáveis com o Ollama e vídeos cartoon 2D com personagens reutilizáveis, voz local em português brasileiro e legendas sincronizadas. Revise o MP4 na própria aba e prepare um rascunho de Reel. [Instalação da voz e guia de Histórias IA](docs/historias-ia.md)
 
 ## Fase 1 do AI Shorts Studio 2.0
 

@@ -1,4 +1,4 @@
-param([switch]$SomenteOllama, [switch]$SemNavegador)
+param([switch]$SomenteOllama, [switch]$SemNavegador, [switch]$SemBaixarModelo)
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ambiente-fase1.ps1')
@@ -39,14 +39,19 @@ try {
         }
     }
 
-    if ($availableModels.models.name -notcontains $phaseModel) {
+    $missingDefault = $availableModels.models.name -notcontains $phaseModel
+    if ($missingDefault -and -not $SemBaixarModelo) {
         & $ollamaExe pull $phaseModel
         if ($LASTEXITCODE -ne 0) {
             throw "Falha ao baixar o modelo $phaseModel."
         }
     }
 
-    Write-Host "Ollama disponível em $ollamaUrl com $phaseModel."
+    if ($missingDefault -and $SemBaixarModelo) {
+        Write-Host "Ollama disponível em $ollamaUrl. Use um modelo já instalado."
+    } else {
+        Write-Host "Ollama disponível em $ollamaUrl com $phaseModel."
+    }
     if ($SomenteOllama) {
         if ($ollamaProcess) {
             Write-Host 'Mantenha este terminal aberto enquanto executa o teste. Use Ctrl+C para encerrar.'
