@@ -29,6 +29,9 @@ $env:OLLAMA_NO_CLOUD = '1'
 if (-not $env:AI_SHORTS_STORY_VOICES) {
     $env:AI_SHORTS_STORY_VOICES = Join-Path $fase1Root 'cache/piper'
 }
+if (-not $env:AI_SHORTS_STORY_KOKORO) {
+    $env:AI_SHORTS_STORY_KOKORO = Join-Path $fase1Root 'cache/kokoro'
+}
 $env:PYTHONUTF8 = '1'
 if (($env:PATH -split ';') -notcontains $ffmpegDir) {
     $env:PATH = "$ffmpegDir;$env:PATH"

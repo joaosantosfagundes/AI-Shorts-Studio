@@ -82,7 +82,8 @@ try {
         'autoclip-instagram-unified.patch',
         'autoclip-instagram-localdomain.patch',
         'autoclip-instagram-oauth.patch',
-        'autoclip-stories.patch'
+        'autoclip-stories.patch',
+        'autoclip-stories-3d.patch'
     )
     # Os patches seguintes podem substituir o contexto dos anteriores.
     $nextPatch = 0

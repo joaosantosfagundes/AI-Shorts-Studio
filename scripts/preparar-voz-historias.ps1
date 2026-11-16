@@ -1,3 +1,5 @@
+param([switch]$Kokoro)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ambiente-fase1.ps1')
 
@@ -41,3 +43,36 @@ foreach ($entry in $files) {
     }
 }
 Write-Host "Voz Cadu (pt-BR) pronta em $voiceDir."
+
+if ($Kokoro) {
+    $kokoroDir = (New-Item -ItemType Directory -Force -Path $env:AI_SHORTS_STORY_KOKORO).FullName
+    $export = 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/468588286ebb2dd77c25b9771e5d165896538cce'
+    $original = 'https://huggingface.co/hexgrad/Kokoro-82M/resolve/4a34baf21f785e7cd08e41a290dffeb1fd0b66b7'
+    $assets = @(
+        @("$export/onnx/model_quantized.onnx", 'model_quantized.onnx', 'FBAE9257E1E05FFC727E951EF9B9C98418E6D79F1C9B6B13BD59F5C9028A1478'),
+        @("$export/voices/pf_dora.bin", 'pf_dora.bin', '3DA7B5B2D91847EBF5646F57631AF6ECECAE3C29A89CD300F06EDF9AA6CFE9EE'),
+        @("$export/voices/pm_alex.bin", 'pm_alex.bin', '0175C753F59C54E7FD5A995BEDEF0C5FF2FB67E0043DD3DCB2AE74EC2ACBEB2A'),
+        @("$export/voices/pm_santa.bin", 'pm_santa.bin', '8B012DB3185778AFE2E45A62CBAD69DB73021774FE68DDA634BCC748A982EEDE'),
+        @("$original/config.json", 'config.json', '5ABB01E2403B072BF03D04FDE160443E209D7A0DAD49A423BE15196B9B43C17F')
+    )
+    foreach ($asset in $assets) {
+        $target = Join-Path $kokoroDir $asset[1]
+        if (Test-Path -LiteralPath $target -PathType Leaf) {
+            if ((Get-FileHash -LiteralPath $target).Hash -ne $asset[2]) {
+                throw "O arquivo existente $target tem outra versão. Use outro diretório em AI_SHORTS_STORY_KOKORO."
+            }
+            continue
+        }
+        $download = "$target.part"
+        & curl.exe --fail --silent --show-error --location --max-time 600 --continue-at - --output $download $asset[0]
+        if ($LASTEXITCODE -ne 0) {
+            throw "A transferência de $($asset[1]) foi interrompida. Rode este script novamente para retomar."
+        }
+        if ((Get-FileHash -LiteralPath $download).Hash -ne $asset[2]) {
+            throw "SHA-256 incorreto em $download. Mova esse arquivo para outro nome antes de tentar novamente."
+        }
+        Move-Item -LiteralPath $download -Destination $target
+    }
+    Write-Host 'Kokoro pt-BR pronto com Dora, Alex e Santa. Pesos sob Apache 2.0.'
+    Write-Host 'Ficha do modelo em https://huggingface.co/hexgrad/Kokoro-82M'
+}

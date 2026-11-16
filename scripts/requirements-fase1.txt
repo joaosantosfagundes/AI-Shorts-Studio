@@ -25,6 +25,7 @@ filelock==4.2.10
 flatbuffers==25.12.19
 fonttools==4.68.0
 fsspec==2026.9.0
+glcontext==3.0.0
 google-auth==2.62.2
 google-genai==3.3.0
 h11==0.16.0
@@ -48,6 +49,7 @@ markdown-it-py==4.3.0
 matplotlib==3.11.2
 mdurl==0.1.2
 mediapipe==1.2.3
+moderngl==5.12.0
 more-itertools==11.2.1
 mypy==2.4.1
 mypy-extensions==1.2.0

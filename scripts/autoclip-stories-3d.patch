@@ -1,0 +1,3507 @@
+diff --git a/backend/autoclip/stories/api.py b/backend/autoclip/stories/api.py
+--- a/backend/autoclip/stories/api.py
++++ b/backend/autoclip/stories/api.py
+@@ -1,16 +1,31 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import importlib.util
++import re
+ from pathlib import Path
+ from typing import Annotated
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Request, Response
+ from fastapi.responses import FileResponse
++from pydantic import Field
+ 
+ from ..instagram.api import only_local
+-from . import art, narration, writer
++from . import art, cartoon3d, narration, writer
+ from .runner import StoryRunner
+-from .schema import HEIGHT, WIDTH, Character, Script, StoryData, StoryError, StorySpec, StoryTask
++from .schema import (
++    HEIGHT,
++    WIDTH,
++    Character,
++    EpisodeNotes,
++    Script,
++    StoryData,
++    StoryError,
++    StorySpec,
++    StoryTask,
++    Style,
++    Title,
++)
+ from .store import Busy, StoryStore
+ 
+ router = APIRouter(prefix="/api/stories", dependencies=[Depends(only_local)])
+@@ -56,6 +71,19 @@
+     spec: StorySpec
+ 
+ 
++class VoicePreview(StoryData):
++    voice: str = Field(min_length=1, max_length=81)
++    speed: float = Field(default=1, ge=0.8, le=1.25)
++
++
++class SeriesCreate(StoryData):
++    title: Title
++
++
++class Continuation(StoryData):
++    idea: str = Field(default="", max_length=1200)
++
++
+ @router.get("/options")
+ async def options() -> dict:
+     problem = None
+@@ -69,13 +97,39 @@
+         "models": models,
+         "ollama_problem": problem,
+         "voices": list(narration.available_voices()),
++        "voice_profiles": narration.voice_catalog(),
+         "piper_installed": importlib.util.find_spec("piper") is not None,
++        "renderer_3d": importlib.util.find_spec("moderngl") is not None,
+         "width": WIDTH,
+         "height": HEIGHT,
+         "word_captions": False,
+     }
+ 
+ 
++@router.post("/voice-previews")
++async def preview_voice(body: VoicePreview, runner: Runner) -> dict:
++    voice = narration.available_voices().get(body.voice)
++    if voice is None:
++        raise HTTPException(422, "Esta voz precisa estar instalada para a comparação.")
++    if runner.workstation.locked():
++        raise HTTPException(409, "Aguarde a produção atual para ouvir uma amostra de voz.")
++    try:
++        async with runner.workstation:
++            path = await asyncio.to_thread(
++                narration.sample_voice, voice, body.speed, runner.store.home / "cache"
++            )
++    except (StoryError, OSError) as error:
++        raise HTTPException(422, str(error)) from None
++    return {"id": path.stem}
++
++
++@router.get("/voice-previews/{identity}")
++def voice_audio(identity: str, store: Store) -> FileResponse:
++    if not re.fullmatch(r"[0-9a-f]{64}", identity):
++        raise HTTPException(404, "Amostra de voz indisponível.")
++    return _file(store, store.home / "cache" / "voice-previews" / f"{identity}.wav", "audio/wav")
++
++
+ @router.get("")
+ def projects(store: Store) -> list[dict]:
+     return store.projects()
+@@ -87,8 +141,12 @@
+ 
+ 
+ @router.get("/style-preview")
+-def style_preview(store: Store) -> FileResponse:
+-    png = art.style_preview(store.home / "cache" / "art")
++def style_preview(store: Store, style: Style = "cartoon-2d") -> FileResponse:
++    library = cartoon3d if style == "cartoon-3d" else art
++    try:
++        png = library.style_preview(store.home / "cache" / "art")
++    except StoryError as error:
++        raise HTTPException(503, str(error)) from None
+     return _file(store, png, "image/png")
+ 
+ 
+@@ -134,6 +192,32 @@
+         raise _error(error) from None
+ 
+ 
++@router.put("/{project}/episode")
++def save_episode(project: str, notes: EpisodeNotes, store: Store) -> dict:
++    try:
++        return store.save_notes(project, notes)
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
++@router.post("/{project}/series", status_code=201)
++def create_series(project: str, body: SeriesCreate, store: Store) -> dict:
++    try:
++        return store.start_series(project, body.title)
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
++@router.post("/{project}/continuation", status_code=201)
++def next_episode(project: str, body: Continuation, store: Store) -> dict:
++    try:
++        if body.idea and len(body.idea) < 4:
++            raise StoryError("Escreva pelo menos quatro caracteres para a ideia do episódio.")
++        return store.continue_series(project, body.idea)
++    except (StoryError, KeyError) as error:
++        raise _error(error) from None
++
++
+ @router.post("/{project}/tasks", status_code=202)
+ async def start(project: str, operation: StoryTask, runner: Runner) -> dict:
+     try:
+@@ -175,7 +259,11 @@
+     row = get(project, store)
+     characters = (row["script"] or {}).get("characters", [])
+     character = next((item for item in characters if item["id"] == key), None)
+-    if character is None:
++    if character is None or character["species"] == "pendente":
+         raise HTTPException(404, "Ficha visual indisponível.")
+-    png = art.reference(store.home / "cache" / "art", Character.model_validate(character))
++    library = cartoon3d if row["spec"]["style"] == "cartoon-3d" else art
++    try:
++        png = library.reference(store.home / "cache" / "art", Character.model_validate(character))
++    except StoryError as error:
++        raise HTTPException(503, str(error)) from None
+     return _file(store, png, "image/png")
+diff --git a/backend/autoclip/stories/art.py b/backend/autoclip/stories/art.py
+--- a/backend/autoclip/stories/art.py
++++ b/backend/autoclip/stories/art.py
+@@ -18,7 +18,7 @@
+ PINK = "#ee9b9c"
+ GOLD = "#fed078"
+ TEAL = "#93d0bd"
+-ASSET_VERSION = "cartoon-v1"
++ASSET_VERSION = "cartoon-v2"
+ SIZE = 400
+ CANVAS = (WIDTH, HEIGHT)
+ PALETTES = {
+@@ -53,6 +53,8 @@
+ 
+ def _body(character: Character) -> Image.Image:
+     image = Image.new("RGBA", (SIZE, SIZE))
++    if character.species == "estrela":
++        return image
+     draw = ImageDraw.Draw(image)
+     base = character.color
+     lighter = _tone(base, CREAM, 0.7)
+@@ -101,7 +103,9 @@
+         right_ear = [(SIZE - x, y) for x, y in left_ear]
+         for ear in (left_ear, right_ear):
+             draw.polygon(ear, fill=base, outline=INK, width=8)
+-    if character.species == "robo":
++    if character.species == "estrela":
++        _star(draw, 200, 143, 125, base)
++    elif character.species == "robo":
+         draw.line((200, 49, 200, 91), fill=INK, width=8)
+         _ellipse(draw, (184, 27, 216, 58), PINK, 6)
+         _rounded(draw, (83, 85, 317, 224), 44, base)
+@@ -148,13 +152,15 @@
+ 
+ def _paw(character: Character) -> Image.Image:
+     image = Image.new("RGBA", (SIZE, SIZE))
++    if character.species == "estrela":
++        return image
+     draw = ImageDraw.Draw(image)
+     _rounded(draw, (250, 221, 292, 301), 19, character.color, 6)
+     draw.line((267, 287, 267, 296), fill=INK, width=3)
+     return image
+ 
+ 
+-def _cached_png(folder: Path, key: str, make: Callable[[], Image.Image]) -> Path:
++def cached_png(folder: Path, key: str, make: Callable[[], Image.Image]) -> Path:
+     identity = hashlib.sha256(f"{ASSET_VERSION}/{key}".encode()).hexdigest()[:24]
+     name = folder / f"{identity}.png"
+     if name.is_file():
+@@ -171,7 +177,7 @@
+ 
+ 
+ def _layer(folder: Path, key: str, make: Callable[[], Image.Image]) -> Image.Image:
+-    with Image.open(_cached_png(folder, key, make)) as image:
++    with Image.open(cached_png(folder, key, make)) as image:
+         return image.copy()
+ 
+ 
+@@ -181,6 +187,7 @@
+     head: Image.Image
+     blink: Image.Image
+     paw: Image.Image
++    floating: bool = False
+ 
+     def sprite(self, *, eyes_closed=False, nod=0.0, wave=0.0) -> Image.Image:
+         image = self.body.copy()
+@@ -202,12 +209,13 @@
+         _layer(cache, f"{key}/{mood}/face", lambda: _head(character, mood, False)),
+         _layer(cache, f"{key}/{mood}/blink", lambda: _head(character, mood, True)),
+         _layer(cache, f"{key}/paw", lambda: _paw(character)),
++        character.species == "estrela",
+     )
+ 
+ 
+ def reference(cache: Path, character: Character) -> Path:
+     key = f"{character.species}/{character.color}/{character.accessory}/reference"
+-    return _cached_png(cache, key, lambda: actor(cache, character, "calmo").sprite())
++    return cached_png(cache, key, lambda: actor(cache, character, "calmo").sprite())
+ 
+ 
+ def _background(setting: str, light: str) -> Image.Image:
+@@ -299,20 +307,34 @@
+ ) -> Image.Image:
+     image = background.copy()
+     size = (435 if len(cast) == 1 else 348) + (43 if scene.shot == "proximo" else 0)
+-    centers = (360,) if len(cast) == 1 else (202, 515)
++    anchors = {"esquerda": 202, "centro": 360, "direita": 515}
++    positioned = {place.character: anchors[place.position] for place in scene.placements}
++    default = (360,) if len(cast) == 1 else (202, 515)
++    spare = iter(
++        dict.fromkeys(x for x in (*default, *anchors.values()) if x not in positioned.values())
++    )
++    centers = [positioned[key] if key in positioned else next(spare) for key in scene.characters]
+     for i, (figure, x) in enumerate(zip(cast, centers, strict=True)):
++        moving = scene.characters[i] == (scene.motion_character or scene.characters[0])
+         breath = math.sin(t * 2.6 + i)
+         base_y = 891 - round(size * 0.88) + round(breath * 4)
+-        if scene.motion == "pular" and i == 0:
++        if figure.floating:
++            base_y += 67 + round(breath * 14)
++        if scene.motion == "pular" and moving:
+             base_y -= round(max(0, math.sin(t * 3.4)) ** 2 * 35)
+-        if scene.motion == "entrar" and i == 0:
+-            x -= round(max(0, 1 - t / 0.85) ** 2 * 263)
+-        if scene.motion == "sair" and i == 0:
+-            x += round(max(0, 1 - (length - t) / 0.85) ** 2 * 263)
++        if scene.motion == "entrar" and moving:
++            direction = 1 if x > 360 else -1
++            x += direction * round(max(0, 1 - t / 0.85) ** 2 * 263)
++        if scene.motion == "sair" and moving:
++            direction = -1 if x < 360 and scene.motion_character else 1
++            x += direction * round(max(0, 1 - (length - t) / 0.85) ** 2 * 263)
++        if scene.motion == "caminhar" and moving:
++            x += round(88 * (t / max(length, 0.01) - 0.5))
++            base_y -= round(abs(math.sin(t * 11)) * 11)
+         sprite = figure.sprite(
+             eyes_closed=(t + i * 0.83 + 0.5) % 3.1 > 2.94,
+-            nod=round(math.sin(t * 3.5) * 9) if scene.motion == "balancar_cabeca" and i == 0 else 0,
+-            wave=round(-32 + math.sin(t * 6) * 15) if scene.motion == "acenar" and i == 0 else 0,
++            nod=round(math.sin(t * 3.5) * 9) if scene.motion == "balancar_cabeca" and moving else 0,
++            wave=round(-32 + math.sin(t * 6) * 15) if scene.motion == "acenar" and moving else 0,
+         )
+         sprite = sprite.resize((size, size), Image.Resampling.BILINEAR)
+         image.paste(sprite, (x - size // 2, base_y), sprite)
+@@ -357,4 +379,4 @@
+         figures = [actor(cache, character, scene.mood) for character in (rabbit, owl)]
+         return frame(scene, backdrop(cache, scene), figures, 0.6, scene.seconds)
+ 
+-    return _cached_png(cache, "style-preview", compose)
++    return cached_png(cache, "style-preview", compose)
+diff --git a/backend/autoclip/stories/cartoon3d.py b/backend/autoclip/stories/cartoon3d.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/cartoon3d.py
+@@ -0,0 +1,540 @@
++"""Reusable, original mesh characters and stages for the local OpenGL renderer."""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from pathlib import Path
++
++from PIL import Image, ImageColor
++
++from . import art
++from .geometry import Canvas, Matrix, Vector, transform, turn
++from .schema import Character, Scene
++
++INK = "#25263d"
++EYE = "#252538"
++CREAM = "#fff4dc"
++PINK = "#f5a8b7"
++GOLD = "#ffd576"
++MINT = "#61c8b9"
++SKIES = {
++    "dia": ("#cfeaf4", "#9bc6ad", "#a4cbd6"),
++    "entardecer": ("#f3cdbb", "#bc92af", "#d5a6aa"),
++    "noite": ("#282a4f", "#455470", "#545981"),
++}
++POSITIONS = {"esquerda": -0.59, "centro": 0.0, "direita": 0.59}
++PITCHES = {"medio": 39, "proximo": 33, "aberto": 45, "acompanhar": 39}
++SETTINGS_3D = ("quarto", "jardim", "bosque", "oficina", "rua")
++
++
++def _tone(first: str, second: str, fraction: float) -> str:
++    mix = [
++        round(a + (b - a) * fraction)
++        for a, b in zip(ImageColor.getrgb(first), ImageColor.getrgb(second), strict=True)
++    ]
++    return "#" + "".join(f"{value:02x}" for value in mix)
++
++
++@dataclass(frozen=True)
++class Pose:
++    position: float
++    yaw: float = 0
++    tilt: float = 0
++    nod: float = 0
++    arm: float = 0
++    step: float = 0
++    rise: float = 0
++    eyes: float = 1
++
++
++def _pose(scene: Scene, index: int, at: float, duration: float, x: float) -> Pose:
++    choice = next(
++        (entry for entry in scene.placements if entry.character == scene.characters[index]), None
++    )
++    gaze = choice.gaze if choice else "camera"
++    yaw = 0.0
++    tilt = 0.0
++    if gaze in {"outro", "objeto"}:
++        yaw = (0.67 if gaze == "outro" else 0.48) * (1 if x <= 0 else -1)
++        tilt = 0.10 if gaze == "objeto" else -0.06
++    if gaze == "janela":
++        yaw, tilt = math.atan2(0.51 - x, -3.2), -0.24
++    eyes = 0.11 if (at + index * 0.67 + 0.3) % 3.2 > 3.03 else 1
++    rise = math.sin(at * 2.3 + index) * 0.014
++    nod, arm, gait = 0.0, 0.0, 0.0
++    if scene.characters[index] == (scene.motion_character or scene.characters[0]):
++        if scene.motion == "balancar_cabeca":
++            nod = math.sin(at * 4.1) * 0.14
++        if scene.motion == "acenar":
++            arm = -0.72 + math.sin(at * 6.2) * 0.34
++        if scene.motion == "pular":
++            rise += 0.15 * max(0.0, math.sin(at * 4.6)) ** 2
++        if scene.motion in {"entrar", "sair", "caminhar"}:
++            gait = math.sin(at * 12) * 0.12
++            yaw += 0.23
++            if scene.motion == "entrar":
++                direction = 1 if x > 0 else -1
++                x += direction * 0.95 * max(0.0, 1 - at / 1.2) ** 2
++            elif scene.motion == "sair":
++                direction = -1 if x < 0 else 1
++                x += direction * 0.9 * max(0.0, 1 - (duration - at) / 1.2) ** 2
++            else:
++                x += 0.52 * (min(1.0, at / max(duration, 0.01)) - 0.5)
++    return Pose(x, yaw, tilt, nod, arm, gait, rise, eyes)
++
++
++class Stage:
++    def __init__(self, canvas: Canvas) -> None:
++        self.canvas = canvas
++
++    def _part(
++        self,
++        parent: Matrix,
++        kind: str,
++        at: Vector,
++        size: Vector,
++        shade: str,
++        *,
++        rotation: float = 0,
++        glow: float = 0,
++    ) -> None:
++        local = transform(at, size)
++        if rotation:
++            local = transform(at) @ turn(rotation, 2) @ transform(size=size)
++        self.canvas.draw(kind, parent @ local, shade, glow=glow)
++
++    def _eyes(
++        self,
++        face: Matrix,
++        depth: float,
++        width: float,
++        mood: str,
++        pose: Pose,
++        *,
++        height: float = 0.04,
++        glasses: bool = False,
++    ) -> None:
++        tall = 0.093 if mood in {"surpreso", "assustado"} else 0.075
++        for sign in (-1, 1):
++            x = width * sign
++            if glasses:
++                self._part(
++                    face, "sphere", (x, height, depth - 0.023), (0.124, 0.116, 0.04), "#554a6a"
++                )
++                self._part(
++                    face, "sphere", (x, height, depth + 0.001), (0.100, 0.093, 0.029), "#dddef6"
++                )
++            self._part(
++                face, "sphere", (x, height, depth + 0.017), (0.053, tall * pose.eyes, 0.037), EYE
++            )
++            if pose.eyes > 0.5:
++                self._part(
++                    face,
++                    "sphere",
++                    (x - 0.017, height + 0.024, depth + 0.047),
++                    (0.017, 0.017, 0.009),
++                    "#ffffff",
++                    glow=0.6,
++                )
++            self._part(
++                face,
++                "sphere",
++                (x * 1.22, height - 0.105, depth - 0.02),
++                (0.065, 0.036, 0.026),
++                PINK,
++            )
++            if mood in {"curioso", "triste", "assustado", "surpreso"}:
++                angle = sign * (0.22 if mood == "surpreso" else -0.28)
++                self._part(
++                    face,
++                    "sphere",
++                    (x, height + 0.145, depth),
++                    (0.062, 0.017, 0.021),
++                    EYE,
++                    rotation=angle,
++                )
++
++    def _mouth(self, at: Matrix, mood: str, depth: float, y: float) -> None:
++        if mood in {"surpreso", "assustado"}:
++            self._part(at, "sphere", (0, y, depth), (0.059, 0.075, 0.025), EYE)
++            return
++        curve = -1 if mood == "triste" else 1
++        for x in (-0.055, -0.036, -0.016, 0.006, 0.027, 0.047, 0.061):
++            self._part(
++                at,
++                "sphere",
++                (x, y + curve * (x / 0.07) ** 2 * 0.027, depth),
++                (0.019, 0.016, 0.011),
++                EYE,
++            )
++
++    def character(self, item: Character, mood: str, pose: Pose, at: float) -> None:
++        z = 0.16
++        tone = item.color
++        light = _tone(tone, CREAM, 0.69)
++        dark = _tone(tone, INK, 0.40)
++        self.canvas.draw(
++            "plane", transform((pose.position, 0.012, z), (0.64, 1, 0.50)), "#211e37", shadow=0.33
++        )
++        base = transform((pose.position, pose.rise, z))
++        if item.species == "estrela":
++            float_y = 0.86 + math.sin(at * 2.2) * 0.078
++            face = (
++                base
++                @ transform((0, float_y, 0.055))
++                @ turn(pose.yaw + math.sin(at * 1.35) * 0.18, 1)
++                @ turn(pose.nod, 2)
++            )
++            self._part(face, "star", (0, 0, 0), (0.51, 0.51, 0.58), tone, glow=0.31)
++            self._eyes(
++                face, 0.137, 0.111, mood, pose, height=0.022, glasses=item.accessory == "oculos"
++            )
++            self._mouth(face, mood, 0.168, -0.122)
++            self._accessory(base, item, 0.50 + pose.rise, size=0.78)
++            return
++
++        self._part(base, "sphere", (0, 0.52, -0.03), (0.36, 0.46, 0.31), tone)
++        self._part(base, "sphere", (0, 0.49, 0.206), (0.264, 0.29, 0.096), light)
++        if item.species in {"cachorro", "gato"}:
++            self._part(
++                base, "sphere", (0.36, 0.39, -0.16), (0.12, 0.31, 0.12), tone, rotation=-0.79
++            )
++        for side in (-1, 1):
++            kick = pose.step * side
++            self._part(
++                base,
++                "sphere",
++                (side * 0.211, 0.131 + max(0.0, kick * 0.5), 0.19 + kick),
++                (0.155, 0.13, 0.23),
++                tone,
++            )
++            self._part(
++                base, "sphere", (side * 0.209, 0.117, 0.34 + kick), (0.09, 0.064, 0.057), light
++            )
++            angle = pose.arm if side == 1 else 0.10
++            joint = base @ transform((side * 0.302, 0.64, 0.064)) @ turn(angle, 2)
++            self._part(
++                joint,
++                "sphere",
++                (side * 0.045, -0.132, 0.058),
++                (0.096, 0.194, 0.103),
++                dark if item.species == "coruja" else tone,
++            )
++        self._accessory(base, item, 0.76)
++
++        neck = base @ transform((0, 1.03, 0.067))
++        face = neck @ turn(pose.yaw, 1) @ turn(pose.tilt, 0) @ turn(pose.nod, 2)
++        if item.species == "coelho":
++            for side in (-1, 1):
++                self._part(
++                    face,
++                    "sphere",
++                    (side * 0.204, 0.43, -0.035),
++                    (0.106, 0.279, 0.108),
++                    tone,
++                    rotation=-side * 0.18,
++                )
++                self._part(
++                    face,
++                    "sphere",
++                    (side * 0.203, 0.448, 0.053),
++                    (0.058, 0.197, 0.034),
++                    PINK,
++                    rotation=-side * 0.18,
++                )
++        if item.species in {"gato", "coruja"}:
++            for side in (-1, 1):
++                self._part(
++                    face,
++                    "sphere",
++                    (side * 0.252, 0.305, 0.016),
++                    (0.116, 0.161, 0.124),
++                    dark,
++                    rotation=-side * 0.38,
++                )
++        if item.species == "robo":
++            self._part(face, "sphere", (0, 0.37, 0.015), (0.035, 0.15, 0.035), dark)
++            self._part(face, "sphere", (0, 0.505, 0.015), (0.084, 0.084, 0.084), PINK, glow=0.15)
++            self._part(face, "sphere", (0, 0, -0.025), (0.451, 0.346, 0.349), tone)
++            self._part(face, "sphere", (0, 0.015, 0.25), (0.355, 0.263, 0.139), light)
++        else:
++            self._part(face, "sphere", (0, 0, 0), (0.427, 0.346, 0.328), tone)
++        if item.species == "cachorro":
++            for side in (-1, 1):
++                self._part(
++                    face,
++                    "sphere",
++                    (side * 0.389, -0.025, -0.014),
++                    (0.134, 0.265, 0.146),
++                    dark,
++                    rotation=side * 0.09,
++                )
++            self._part(face, "sphere", (-0.176, 0.043, 0.26), (0.151, 0.150, 0.09), dark)
++        if item.species == "coruja":
++            for side in (-1, 1):
++                self._part(
++                    face, "sphere", (side * 0.151, 0.009, 0.238), (0.193, 0.202, 0.105), light
++                )
++            self._part(face, "sphere", (0, -0.088, 0.331), (0.075, 0.092, 0.083), GOLD)
++        self._eyes(
++            face,
++            0.31 if item.species != "robo" else 0.382,
++            0.155,
++            mood,
++            pose,
++            glasses=item.accessory == "oculos",
++        )
++        depth = 0.351 if item.species not in {"cachorro", "gato", "coelho", "robo"} else 0.41
++        if item.species in {"cachorro", "gato", "coelho"}:
++            self._part(face, "sphere", (0, -0.117, 0.273), (0.206, 0.123, 0.144), light)
++            self._part(face, "sphere", (0, -0.083, 0.406), (0.067, 0.05, 0.035), EYE)
++        self._mouth(face, mood, depth, -0.165)
++
++    def _accessory(self, root: Matrix, character: Character, y: float, size: float = 1) -> None:
++        if character.accessory == "lenco":
++            self._part(root, "sphere", (0, y, 0.036), (0.325 * size, 0.075, 0.286 * size), MINT)
++            self._part(
++                root,
++                "sphere",
++                (0.20 * size, y - 0.13, 0.261),
++                (0.097, 0.176, 0.067),
++                MINT,
++                rotation=0.29,
++            )
++        if character.accessory == "gravata":
++            for sign in (-1, 1):
++                self._part(
++                    root,
++                    "sphere",
++                    (sign * 0.105 * size, y, 0.295),
++                    (0.11, 0.068, 0.045),
++                    PINK,
++                    rotation=sign * 0.26,
++                )
++            self._part(root, "sphere", (0, y, 0.326), (0.056, 0.047, 0.043), "#df788f")
++        if character.accessory == "broche":
++            self._part(root, "star", (0.148 * size, y - 0.09, 0.319), (0.081, 0.081, 0.12), GOLD)
++
++    def _room(
++        self, root: Matrix, sky: str, floor: str, wall: str, *, workshop: bool, night: bool
++    ) -> None:
++        for x, y, sx, sy in (
++            (-2.70, 2, 2.52, 3),
++            (2.28, 2, 1.13, 3),
++            (0.505, 4.24, 0.697, 1.2),
++            (0.505, 0.54, 0.697, 0.88),
++        ):
++            self._part(root, "box", (x, y, -3.05), (sx, sy, 0.12), wall)
++        for x in (-0.21, 0.51, 1.23):
++            self._part(root, "box", (x, 2.25, -2.90), (0.043, 0.88, 0.078), "#c3b6df")
++        for y in (1.39, 2.24, 3.11):
++            self._part(root, "box", (0.51, y, -2.9), (0.77, 0.043, 0.08), "#c3b6df")
++        self._part(root, "box", (0.53, 1.34, -2.83), (0.87, 0.048, 0.19), "#aca0c6")
++        light = "#fff0c2" if night else GOLD
++        self._part(root, "sphere", (0.76, 2.68, -4.05), (0.225, 0.225, 0.192), light, glow=0.88)
++        if night:
++            for x, y in ((0.22, 2.64), (0.90, 1.91), (0.30, 2.03), (0.12, 2.82)):
++                self._part(root, "star", (x, y, -3.7), (0.05, 0.05, 0.06), CREAM, glow=0.6)
++        self._part(root, "sphere", (0, 0.005, -0.1), (1.91, 0.014, 1.26), _tone(floor, sky, 0.64))
++        if workshop:
++            self._part(root, "box", (-1.38, 0.5, -2.30), (0.42, 0.50, 0.27), "#aa7787")
++            self._part(root, "box", (-1.38, 0.99, -2.3), (0.54, 0.067, 0.32), "#ecc898")
++        else:
++            self._part(root, "box", (-1.53, 0.35, -2.08), (0.43, 0.34, 0.35), "#9f79b3")
++            self._part(root, "sphere", (-1.53, 0.712, -2.08), (0.35, 0.072, 0.30), "#d8b4d2")
++
++    def _outdoor(
++        self, root: Matrix, sky: str, floor: str, background: str, setting: str, night: bool
++    ) -> None:
++        self._part(root, "sphere", (-2.8, -0.10, -5), (4.0, 0.65, 2.1), background)
++        self._part(root, "sphere", (3.2, -0.08, -6), (4.4, 0.78, 2.4), _tone(background, sky, 0.39))
++        self._part(
++            root,
++            "sphere",
++            (1.64, 3.21, -5.7),
++            (0.37, 0.37, 0.29),
++            CREAM if night else GOLD,
++            glow=0.9,
++        )
++        if night:
++            for x, y, z in (
++                (-1.8, 3.1, -4.9),
++                (-0.6, 3.52, -5),
++                (-1.05, 2.63, -5.2),
++                (1.07, 3.59, -6),
++                (2.84, 2.72, -6),
++            ):
++                self._part(root, "star", (x, y, z), (0.051, 0.051, 0.075), "#e8dafa", glow=0.75)
++        if setting == "rua":
++            for x, y in ((-1.92, 1.35), (1.70, 1.08), (2.9, 1.42)):
++                self._part(
++                    root, "box", (x, y, -3.8), (0.65, y, 0.43), _tone(background, "#8f6c95", 0.48)
++                )
++                for side in (-1, 1):
++                    self._part(
++                        root,
++                        "box",
++                        (x + side * 0.24, y + 0.3, -3.36),
++                        (0.105, 0.15, 0.017),
++                        GOLD,
++                        glow=0.28 if night else 0.0,
++                    )
++            self._part(root, "box", (0, 0.018, -0.30), (5, 0.014, 1.25), _tone(floor, sky, 0.35))
++            return
++        for x, y in (
++            ((-1.54, 1.27), (1.55, 1.42), (2.33, 1.76))
++            if setting == "bosque"
++            else ((-1.48, 0.51), (1.62, 0.61))
++        ):
++            if setting == "bosque":
++                self._part(root, "sphere", (x, y * 0.62, -2.8), (0.12, y * 0.66, 0.12), "#625066")
++            self._part(
++                root, "sphere", (x, y, -2.75), (0.53, y * 0.58, 0.44), _tone(floor, "#69a899", 0.44)
++            )
++            self._part(
++                root,
++                "sphere",
++                (x + 0.31, y * 0.88, -2.59),
++                (0.31, y * 0.43, 0.34),
++                _tone(floor, "#7db799", 0.51),
++            )
++        for x, z in ((-1.52, -0.49), (1.28, -0.61), (1.57, -0.85)):
++            self._part(root, "sphere", (x, 0.088, z), (0.043, 0.095, 0.034), "#6aaf9e")
++            self._part(root, "sphere", (x, 0.174, z), (0.071, 0.054, 0.055), "#bca5da")
++
++    def _prop(self, kind: str, at: float) -> None:
++        if kind == "nenhum":
++            return
++        root = transform((0.03, 0.14, 0.59))
++        if kind == "estrela":
++            self._part(
++                root,
++                "star",
++                (0, 0.15 + 0.04 * math.sin(at * 3), 0),
++                (0.23, 0.23, 0.30),
++                GOLD,
++                rotation=0.14,
++                glow=0.36,
++            )
++        elif kind == "bola":
++            self._part(root, "sphere", (0, 0.019, 0), (0.157, 0.157, 0.157), PINK)
++        elif kind in {"bilhete", "livro"}:
++            self._part(
++                root,
++                "box",
++                (0, 0.01, 0),
++                (0.20, 0.042, 0.127),
++                CREAM if kind == "bilhete" else "#ab8fd0",
++            )
++            self._part(root, "box", (0, 0.034, 0.125), (0.175, 0.019, 0.006), "#f1e4ca")
++        elif kind == "chave":
++            self._part(root, "sphere", (-0.105, -0.011, 0.021), (0.089, 0.046, 0.083), GOLD)
++            self._part(root, "sphere", (0.042, -0.009, 0.021), (0.171, 0.037, 0.033), GOLD)
++            self._part(root, "box", (0.172, -0.013, 0.069), (0.021, 0.022, 0.062), GOLD)
++        elif kind == "lanterna":
++            self._part(root, "sphere", (0, 0.024, 0), (0.20, 0.112, 0.11), MINT)
++            self._part(root, "sphere", (0.127, 0.024, 0), (0.10, 0.13, 0.13), GOLD, glow=0.48)
++        elif kind == "semente":
++            self._part(
++                root, "sphere", (0, -0.015, 0.02), (0.102, 0.11, 0.079), "#e5b374", rotation=0.58
++            )
++            self._part(
++                root, "sphere", (0.052, 0.072, 0.012), (0.073, 0.038, 0.046), MINT, rotation=0.26
++            )
++
++    def frame(
++        self, scene: Scene, cast: dict[str, Character], at: float, duration: float
++    ) -> Image.Image:
++        sky, floor, background = SKIES[scene.light]
++        indoors = scene.setting in {"quarto", "oficina"}
++        closeness = PITCHES[scene.shot]
++        if len(scene.characters) > 1:
++            closeness = max(38, closeness)
++        camera_shift = (
++            (0.24 * (at / max(duration, 0.01) - 0.5)) if scene.shot == "acompanhar" else 0.0
++        )
++        self.canvas.start(
++            (camera_shift + 0.075 * math.sin(at * 0.87), 2.28, 6.8),
++            (camera_shift, 1.55, 0),
++            closeness,
++            sky,
++            float(scene.light == "noite"),
++        )
++        world = transform()
++        self._part(world, "box", (0, -0.17, -1), (9, 0.17, 10), floor)
++        if indoors:
++            self._room(
++                world,
++                sky,
++                floor,
++                background,
++                workshop=scene.setting == "oficina",
++                night=scene.light == "noite",
++            )
++        else:
++            self._outdoor(world, sky, floor, background, scene.setting, scene.light == "noite")
++        positions = {place.character: POSITIONS[place.position] for place in scene.placements}
++        defaults = (
++            (0.0,) if len(scene.characters) == 1 else (POSITIONS["esquerda"], POSITIONS["direita"])
++        )
++        spare = [x for x in (*defaults, *POSITIONS.values()) if x not in positions.values()]
++        for i, key in enumerate(scene.characters):
++            position = positions[key] if key in positions else spare.pop(0)
++            self.character(cast[key], scene.mood, _pose(scene, i, at, duration, position), at)
++        self._prop(scene.prop, at)
++        return self.canvas.image()
++
++    def portrait(self, character: Character) -> Image.Image:
++        self.canvas.start((0.20, 1.66, 4.1), (0, 0.81, 0), 31, "#d7d2e8", 0.05)
++        self._part(transform(), "box", (0, -0.17, 0), (6, 0.17, 6), "#bab6d2")
++        self.character(character, "feliz", Pose(0, yaw=-0.14), 0)
++        return self.canvas.image()
++
++
++def reference(cache: Path, character: Character) -> Path:
++    def draw() -> Image.Image:
++        with Canvas((400, 400)) as canvas:
++            return Stage(canvas).portrait(character)
++
++    key = f"3d/portrait/v1/{character.species}/{character.color}/{character.accessory}"
++    return art.cached_png(cache, key, draw)
++
++
++def style_preview(cache: Path) -> Path:
++    def draw() -> Image.Image:
++        pingo = Character(
++            id="pingo",
++            name="Pingo",
++            species="cachorro",
++            visual="Caramelo e lenço menta",
++            color="#dc9d79",
++            accessory="lenco",
++        )
++        lumina = Character(
++            id="lumina",
++            name="Lumina",
++            species="estrela",
++            visual="Dourada com rosto",
++            color="#ffcc65",
++        )
++        scene = Scene(
++            id="encontro",
++            title="O brilho na janela",
++            setting="quarto",
++            light="noite",
++            characters=["pingo", "lumina"],
++            narration="Uma estrela visitou Pingo.",
++            action="Os dois se olham perto da janela.",
++            mood="curioso",
++            motion="observar",
++            placements=[
++                {"character": "pingo", "position": "esquerda", "gaze": "outro"},
++                {"character": "lumina", "position": "direita", "gaze": "outro"},
++            ],
++            seconds=5,
++        )
++        with Canvas((360, 640)) as canvas:
++            return Stage(canvas).frame(scene, {"pingo": pingo, "lumina": lumina}, 0.5, 5)
++
++    return art.cached_png(cache, "3d/style-preview/v1", draw)
+diff --git a/backend/autoclip/stories/geometry.py b/backend/autoclip/stories/geometry.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/geometry.py
+@@ -0,0 +1,277 @@
++"""Headless OpenGL primitives, depth buffering and lighting for story frames."""
++
++from __future__ import annotations
++
++import math
++from functools import lru_cache
++
++import numpy as np
++from PIL import Image, ImageColor
++
++from .schema import StoryError
++
++Vector = tuple[float, float, float]
++Matrix = np.ndarray
++
++VERTEX = """
++#version 330
++in vec3 point;
++in vec3 direction;
++uniform mat4 world;
++uniform mat4 view_projection;
++out vec3 normal;
++out vec3 position;
++out vec3 local;
++void main() {
++    local = point;
++    vec4 coordinates = world * vec4(point, 1.0);
++    position = coordinates.xyz;
++    normal = transpose(inverse(mat3(world))) * direction;
++    gl_Position = view_projection * coordinates;
++}
++"""
++
++FRAGMENT = """
++#version 330
++in vec3 normal;
++in vec3 position;
++in vec3 local;
++out vec4 pixel;
++uniform vec3 pigment;
++uniform vec3 eye;
++uniform vec3 horizon;
++uniform float night;
++uniform float emissive;
++uniform float shadow;
++void main() {
++    if (shadow > 0.0) {
++        float opacity = pow(max(0.0, 1.0 - dot(local.xz, local.xz)), 2.0) * shadow;
++        if (opacity < 0.005) discard;
++        pixel = vec4(pigment, opacity);
++        return;
++    }
++    vec3 n = normalize(normal);
++    vec3 key = normalize(vec3(-0.56, 0.84, 0.48));
++    vec3 half_angle = normalize(key + normalize(eye - position));
++    float diffuse = dot(n, key) * 0.5 + 0.5;
++    float rim = max(0.0, dot(n, normalize(vec3(0.63, 0.45, -0.65))));
++    float polish = pow(max(0.0, dot(n, half_angle)), 28.0) * 0.08;
++    float fill = 0.48 + 0.40 * diffuse + 0.15 * rim;
++    vec3 light = mix(vec3(1.0, 0.97, 0.92), vec3(0.85, 0.88, 1.0), 0.55 * night);
++    vec3 lit = pigment * light * fill + vec3(polish);
++    lit = mix(lit, pigment, emissive);
++    float haze = clamp((distance(position, eye) - 8.0) * 0.027, 0.0, 0.28);
++    pixel = vec4(mix(lit, horizon, haze * (1.0 - emissive)), 1.0);
++}
++"""
++
++
++def transform(where: Vector = (0, 0, 0), size: Vector = (1, 1, 1)) -> Matrix:
++    matrix = np.diag((*size, 1)).astype("f4")
++    matrix[:3, 3] = where
++    return matrix
++
++
++def turn(angle: float, axis: int) -> Matrix:
++    matrix = np.eye(4, dtype="f4")
++    first, second = (axis + 1) % 3, (axis + 2) % 3
++    sine, cosine = math.sin(angle), math.cos(angle)
++    matrix[first, first] = matrix[second, second] = cosine
++    matrix[first, second], matrix[second, first] = -sine, sine
++    return matrix
++
++
++def _unit(vector: np.ndarray) -> np.ndarray:
++    return vector / np.linalg.norm(vector)
++
++
++def camera(eye: Vector, target: Vector, aspect: float, lens: float) -> Matrix:
++    position = np.asarray(eye, dtype="f4")
++    forward = _unit(np.asarray(target, dtype="f4") - position)
++    right = _unit(np.cross(forward, (0, 1, 0)))
++    up = np.cross(right, forward)
++    view = np.eye(4, dtype="f4")
++    view[:3, :3] = np.stack((right, up, -forward))
++    view[:3, 3] = -view[:3, :3] @ position
++    near, far = 0.08, 55.0
++    focus = 1 / math.tan(math.radians(lens) / 2)
++    project = np.asarray(
++        [
++            [focus / aspect, 0, 0, 0],
++            [0, focus, 0, 0],
++            [0, 0, -(far + near) / (far - near), -2 * far * near / (far - near)],
++            [0, 0, -1, 0],
++        ],
++        dtype="f4",
++    )
++    return project @ view
++
++
++def _sphere() -> tuple[np.ndarray, np.ndarray]:
++    slices, rings = 24, 14
++    vertices, faces = [], []
++    for ring in range(rings + 1):
++        theta = math.pi * ring / rings
++        for index in range(slices + 1):
++            phi = 2 * math.pi * index / slices
++            point = (
++                math.sin(theta) * math.cos(phi),
++                math.cos(theta),
++                math.sin(theta) * math.sin(phi),
++            )
++            vertices.append((*point, *point))
++            if ring < rings and index < slices:
++                first = ring * (slices + 1) + index
++                second = first + slices + 1
++                faces.extend((first, first + 1, second, first + 1, second + 1, second))
++    return np.asarray(vertices, dtype="f4"), np.asarray(faces, dtype="i4")
++
++
++def _flat(triangles: list[tuple[Vector, Vector, Vector]]) -> tuple[np.ndarray, np.ndarray]:
++    vertices = []
++    for triangle in triangles:
++        a, b, c = np.asarray(triangle)
++        normal = _unit(np.cross(b - a, c - a))
++        vertices.extend((*point, *normal) for point in triangle)
++    return np.asarray(vertices, dtype="f4"), np.arange(len(vertices), dtype="i4")
++
++
++def _box() -> tuple[np.ndarray, np.ndarray]:
++    corners = [
++        (-1, -1, -1),
++        (1, -1, -1),
++        (1, 1, -1),
++        (-1, 1, -1),
++        (-1, -1, 1),
++        (1, -1, 1),
++        (1, 1, 1),
++        (-1, 1, 1),
++    ]
++    quads = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 4, 7, 3), (1, 2, 6, 5), (0, 1, 5, 4), (3, 7, 6, 2)]
++    return _flat(
++        [
++            tuple(corners[key] for key in triangle)
++            for a, b, c, d in quads
++            for triangle in ((a, b, c), (a, c, d))
++        ]
++    )
++
++
++def _star() -> tuple[np.ndarray, np.ndarray]:
++    contour = [
++        (
++            math.cos(math.pi / 2 + index * math.pi / 5) * (1 if index % 2 == 0 else 0.51),
++            math.sin(math.pi / 2 + index * math.pi / 5) * (1 if index % 2 == 0 else 0.51),
++        )
++        for index in range(10)
++    ]
++    front = [(x * 0.88, y * 0.88, 0.24) for x, y in contour]
++    bevel = [(x, y, 0.09) for x, y in contour]
++    back = [(x, y, -z) for x, y, z in front]
++    rear_bevel = [(x, y, -z) for x, y, z in bevel]
++    faces = []
++    for index in range(len(contour)):
++        next_index = (index + 1) % len(contour)
++        faces.extend(
++            (
++                ((0, 0, 0.24), front[index], front[next_index]),
++                (front[index], bevel[index], bevel[next_index]),
++                (front[index], bevel[next_index], front[next_index]),
++                (bevel[index], rear_bevel[index], rear_bevel[next_index]),
++                (bevel[index], rear_bevel[next_index], bevel[next_index]),
++                (rear_bevel[index], back[index], back[next_index]),
++                (rear_bevel[index], back[next_index], rear_bevel[next_index]),
++                ((0, 0, -0.24), back[next_index], back[index]),
++            )
++        )
++    return _flat(faces)
++
++
++def _plane() -> tuple[np.ndarray, np.ndarray]:
++    a, b, c, d = (-1, 0, -1), (-1, 0, 1), (1, 0, 1), (1, 0, -1)
++    return _flat([(a, b, c), (a, c, d)])
++
++
++@lru_cache(maxsize=128)
++def color(hex_value: str) -> Vector:
++    r, g, b = ImageColor.getrgb(hex_value)
++    return r / 255, g / 255, b / 255
++
++
++class Canvas:
++    def __init__(self, size: tuple[int, int]) -> None:
++        try:
++            import moderngl
++
++            context = moderngl.create_standalone_context(require=330)
++        except (ImportError, OSError, RuntimeError, ValueError) as error:
++            raise StoryError(
++                "Cartoon 3D exige ModernGL e um driver com OpenGL 3.3. "
++                "Atualize a instalação ou selecione Cartoon 2D."
++            ) from error
++        self.modern = moderngl
++        self.context = context
++        self.size = size
++        try:
++            self._setup()
++        except Exception:
++            context.release()
++            raise
++
++    def _setup(self) -> None:
++        context = self.context
++        self.renderer = str(context.info.get("GL_RENDERER", "OpenGL"))
++        self.program = context.program(vertex_shader=VERTEX, fragment_shader=FRAGMENT)
++        self.output = context.simple_framebuffer(self.size, components=4)
++        count = min(4, context.max_samples)
++        self.multisample = context.simple_framebuffer(self.size, components=4, samples=count)
++        self.meshes = {}
++        for name, builder in (
++            ("sphere", _sphere),
++            ("box", _box),
++            ("star", _star),
++            ("plane", _plane),
++        ):
++            verts, faces = builder()
++            vertex, index = context.buffer(verts.tobytes()), context.buffer(faces.tobytes())
++            self.meshes[name] = context.vertex_array(
++                self.program, [(vertex, "3f 3f", "point", "direction")], index
++            )
++        context.enable(self.modern.DEPTH_TEST | self.modern.BLEND)
++        context.blend_func = self.modern.SRC_ALPHA, self.modern.ONE_MINUS_SRC_ALPHA
++
++    def __enter__(self) -> Canvas:
++        return self
++
++    def __exit__(self, *_args: object) -> None:
++        self.context.release()
++
++    def start(self, eye: Vector, target: Vector, lens: float, sky: str, night: float) -> None:
++        width, height = self.size
++        tone = color(sky)
++        self.multisample.use()
++        self.multisample.clear(*tone, 1.0, depth=1.0)
++        self.program["view_projection"].write(camera(eye, target, width / height, lens).T.tobytes())
++        self.program["eye"].value = eye
++        self.program["horizon"].value = tone
++        self.program["night"].value = night
++
++    def draw(
++        self,
++        kind: str,
++        matrix: Matrix,
++        pigment: str,
++        *,
++        glow: float = 0,
++        shadow: float = 0,
++    ) -> None:
++        self.program["world"].write(matrix.T.tobytes())
++        self.program["pigment"].value = color(pigment)
++        self.program["emissive"].value = glow
++        self.program["shadow"].value = shadow
++        self.meshes[kind].render()
++
++    def image(self) -> Image.Image:
++        self.context.copy_framebuffer(self.output, self.multisample)
++        raw = self.output.read(components=3, alignment=1)
++        return Image.frombytes("RGB", self.size, raw).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+diff --git a/backend/autoclip/stories/kokoro.py b/backend/autoclip/stories/kokoro.py
+new file mode 100644
+--- /dev/null
++++ b/backend/autoclip/stories/kokoro.py
+@@ -0,0 +1,78 @@
++"""Brazilian Portuguese inference for the pinned Kokoro 82M ONNX export."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import unicodedata
++from pathlib import Path
++
++import numpy as np
++
++from .. import paths
++
++MODEL = "model_quantized.onnx"
++VOICES = {"pf_dora": "Dora", "pm_alex": "Alex", "pm_santa": "Santa"}
++RATE = 24_000
++PHONEME_PAIRS = {"tʃ": "ʧ", "dʒ": "ʤ", "t͡s": "ʦ", "d͡z": "ʣ"}
++
++
++def directory() -> Path:
++    configured = os.environ.get("AI_SHORTS_STORY_KOKORO")
++    return (
++        Path(configured).expanduser().resolve()
++        if configured
++        else paths.root() / "stories" / "kokoro"
++    )
++
++
++def espeak_data() -> Path:
++    from piper.phonemize_espeak import ESPEAK_DATA_DIR
++
++    if os.name == "nt":
++        # Native eSpeak can reject accented absolute paths. Only the speech worker
++        # changes directory, leaving the Studio and the user's terminal alone.
++        os.chdir(ESPEAK_DATA_DIR.parent)
++        os.environ["ESPEAK_DATA_PATH"] = "."
++        return Path("espeak-ng-data")
++    return ESPEAK_DATA_DIR
++
++
++class KokoroVoice:
++    def __init__(self, voice_file: Path) -> None:
++        import onnxruntime as ort
++        from piper.phonemize_espeak import EspeakPhonemizer
++
++        folder = voice_file.parent
++        self.vocab = json.loads((folder / "config.json").read_text(encoding="utf-8"))["vocab"]
++        self.styles = np.fromfile(voice_file, dtype="<f4").reshape(-1, 256)
++        config = ort.SessionOptions()
++        config.intra_op_num_threads = 3
++        config.inter_op_num_threads = 1
++        self.session = ort.InferenceSession(
++            str(folder / MODEL), sess_options=config, providers=["CPUExecutionProvider"]
++        )
++        self.phonemizer = EspeakPhonemizer(espeak_data())
++        self.ids_input = self.session.get_inputs()[0].name
++
++    def speak(self, sentence: str, speed: float) -> np.ndarray:
++        parts = self.phonemizer.phonemize("pt-br", sentence)
++        phonemes = " ".join("".join(part) for part in parts)
++        phonemes = unicodedata.normalize("NFD", phonemes.replace("g", "ɡ"))
++        for pair, token in PHONEME_PAIRS.items():
++            phonemes = phonemes.replace(pair, token)
++        # Preserve the nasal diphthong at the end of Brazilian words such as "tem".
++        phonemes = re.sub(r"eɪ[ŋm](?=$|[\s.,!?;:])", "ẽɪ̃", phonemes)
++        ids = [self.vocab[symbol] for symbol in phonemes.strip() if symbol in self.vocab]
++        if not 0 < len(ids) <= len(self.styles):
++            raise ValueError("Divida a fala em frases curtas com texto pronunciável.")
++        waveform = self.session.run(
++            None,
++            {
++                self.ids_input: np.asarray([[0, *ids, 0]], dtype=np.int64),
++                "style": self.styles[len(ids) - 1 : len(ids)],
++                "speed": np.asarray([speed], dtype=np.float32),
++            },
++        )[0]
++        return np.asarray(waveform, dtype=np.float32).reshape(-1)
+diff --git a/backend/autoclip/stories/narration.py b/backend/autoclip/stories/narration.py
+--- a/backend/autoclip/stories/narration.py
++++ b/backend/autoclip/stories/narration.py
+@@ -1,4 +1,4 @@
+-"""Measure every spoken phrase from Piper's PCM output and build the scene timeline."""
++"""Synthesize locally and measure every spoken phrase from decoded PCM."""
+ 
+ from __future__ import annotations
+ 
+@@ -13,13 +13,25 @@
+ from collections.abc import Callable
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+-from tempfile import TemporaryDirectory
++from tempfile import NamedTemporaryFile, TemporaryDirectory
++
++import numpy as np
+ 
+ from .. import paths
+ from ..pipeline import Cancelled, process
++from . import kokoro
+ from .schema import Script, StoryError, StorySpec
+ 
+ Progress = Callable[[int, int, str], None]
++FALLBACK = "pt_BR-cadu-medium"
++SAMPLE = (
++    "Naquela noite, Pingo ouviu três batidas na porta. Quando olhou pela janela, "
++    "não havia ninguém. Mas uma voz sussurrou: você tem até a meia-noite."
++)
++
++
++class VoiceFailure(StoryError):
++    """A local speech engine failed to produce usable samples."""
+ 
+ 
+ @dataclass(frozen=True)
+@@ -33,6 +45,8 @@
+ class Timeline:
+     boundaries: list[float]
+     cues: list[Cue]
++    voice: str = ""
++    ballot_start: float | None = None
+ 
+ 
+ def voices_dir() -> Path:
+@@ -44,7 +58,13 @@
+     if importlib.util.find_spec("piper") is None:
+         return {}
+     folder = voices_dir()
+-    found = {}
++    kokoro_home = kokoro.directory()
++    found: dict[str, Path] = {}
++    if all((kokoro_home / name).is_file() for name in (kokoro.MODEL, "config.json")):
++        for name in kokoro.VOICES:
++            sample = kokoro_home / f"{name}.bin"
++            if sample.is_file() and sample.resolve().is_relative_to(kokoro_home):
++                found[name] = sample
+     for model in sorted(folder.glob("pt_BR-*.onnx")):
+         config = model.with_suffix(".onnx.json")
+         if not re.fullmatch(r"pt_BR-[A-Za-z0-9_-]{1,75}", model.stem):
+@@ -62,23 +82,72 @@
+     return found
+ 
+ 
++def voice_catalog() -> list[dict[str, str]]:
++    return [
++        {
++            "id": name,
++            "engine": engine(path),
++            "name": kokoro.VOICES[name]
++            if name in kokoro.VOICES
++            else name[6:].split("-")[0].capitalize(),
++        }
++        for name, path in available_voices().items()
++    ]
++
++
++def engine(voice: Path) -> str:
++    return "Kokoro" if voice.suffix == ".bin" else "Piper"
++
++
++def select_voice(requested: str) -> Path:
++    voices = available_voices()
++    selected = voices.get(requested)
++    if selected is None and requested in kokoro.VOICES:
++        selected = voices.get(FALLBACK)
++    if selected is None:
++        raise StoryError(
++            "Selecione uma voz pt-BR instalada. Use scripts/preparar-voz-historias.ps1."
++        )
++    return selected
++
++
+ def phrase_groups(script: Script) -> list[list[str]]:
+-    groups = []
+-    for scene in script.scenes:
+-        fragments = [scene.narration, *(dialogue.text for dialogue in scene.dialogues)]
+-        phrases = []
+-        for fragment in fragments:
+-            normalized = " ".join(fragment.split())
+-            for sentence in re.split(r"(?<=[.!?…])\s+", normalized):
+-                phrases.extend(textwrap.wrap(sentence, width=63, break_on_hyphens=False))
+-        groups.append(phrases)
+-    return groups
++    return [
++        [
++            phrase
++            for text in [scene.narration, *(line.text for line in scene.dialogues)]
++            for phrase in _segments(text)
++        ]
++        for scene in script.scenes
++    ]
++
++
++def _segments(text: str) -> list[str]:
++    normalized = " ".join(text.split())
++    return [
++        fragment
++        for sentence in re.split(r"(?<=[.!?…])\s+", normalized)
++        for fragment in textwrap.wrap(sentence, width=71, break_on_hyphens=False)
++    ]
++
++
++def _gap_seconds(text: str) -> float:
++    if text.endswith("…"):
++        return 0.32
++    return 0.23 if text.endswith((".", "!", "?")) else 0.11
+ 
+ 
+ def _fragment_path(cache: Path, voice: Path, speed: float, phrase: str) -> Path:
+-    files = (voice, voice.with_suffix(".onnx.json"))
++    files = (
++        (voice, voice.parent / kokoro.MODEL, voice.parent / "config.json")
++        if voice.suffix == ".bin"
++        else (voice, voice.with_suffix(".onnx.json"))
++    )
+     identity = [(item.stat().st_size, item.stat().st_mtime_ns) for item in files]
+-    key = json.dumps(["piper-pcm-v1", voice.stem, identity, speed, phrase], ensure_ascii=False)
++    version = "pt-br-v3" if voice.suffix == ".bin" else "pcm-v2"
++    key = json.dumps(
++        [version, engine(voice), voice.stem, identity, speed, phrase], ensure_ascii=False
++    )
+     digest = hashlib.sha256(key.encode()).hexdigest()
+     return cache / f"{digest}.wav"
+ 
+@@ -94,7 +163,8 @@
+         return
+     cache = next(iter(todo.values())).parent
+     cache.mkdir(parents=True, exist_ok=True)
+-    with TemporaryDirectory(prefix="piper-", dir=cache) as work:
++    provider = engine(voice)
++    with TemporaryDirectory(prefix="voz-", dir=cache) as work:
+         request = Path(work) / "frases.json"
+         request.write_text(
+             json.dumps(
+@@ -105,12 +175,12 @@
+         )
+ 
+         def parse(line: str) -> process.Update | None:
+-            _, separator, count = line.strip().partition("piper_frases=")
++            _, separator, count = line.strip().partition("frases=")
+             return process.Update(int(count)) if separator and count.isdigit() else None
+ 
+         result = process.run(
+             [sys.executable, "-m", "autoclip.stories.narration", str(voice), str(request)],
+-            label="Piper",
++            label=provider,
+             parse=parse,
+             idle_timeout_s=90,
+             on_progress=lambda update: progress(int(update.position)),
+@@ -118,32 +188,30 @@
+             kill_tree=True,
+         )
+     if result.stalled:
+-        raise StoryError(
+-            "O Piper ficou 90 segundos sem gerar uma frase. Verifique a voz instalada."
++        raise VoiceFailure(
++            f"O {provider} ficou 90 segundos sem gerar uma frase. Confira a voz instalada."
+         )
+     if result.code:
+         detail = result.stderr.strip().splitlines()[-1:]
+         suffix = f" {detail[0][:220]}" if detail else ""
+-        raise StoryError(f"Falha na narração Piper (código {result.code}).{suffix}")
++        raise VoiceFailure(f"Falha na narração {provider} (código {result.code}).{suffix}")
+ 
+ 
+ def _pcm(filename: Path) -> tuple[int, bytes]:
+     try:
+         with wave.open(str(filename), "rb") as source:
+             if source.getnchannels() != 1 or source.getsampwidth() != 2:
+-                raise StoryError("A voz deve fornecer áudio PCM mono de 16 bits.")
++                raise VoiceFailure("A voz deve fornecer áudio PCM mono de 16 bits.")
+             rate = source.getframerate()
+             frames = source.getnframes()
+             if not (8_000 <= rate <= 48_000 and 0 < frames <= rate * 60):
+-                raise StoryError("O Piper devolveu uma frase vazia ou com duração inválida.")
++                raise VoiceFailure("A voz devolveu uma frase vazia ou com duração inválida.")
+             data = source.readframes(frames)
+             if len(data) != frames * 2 or not any(data):
+-                raise StoryError("O Piper devolveu áudio vazio. Confira o texto e a voz instalada.")
++                raise VoiceFailure("A voz devolveu áudio vazio. Confira o texto e a instalação.")
+             return rate, data
+     except (OSError, EOFError, wave.Error):
+-        raise StoryError(
+-            "Não foi possível ler o áudio gerado pelo Piper. Regenere a narração."
+-        ) from None
++        raise VoiceFailure("Não foi possível ler o áudio gerado. Regenere a narração.") from None
+ 
+ 
+ def make_narration(
+@@ -156,6 +224,34 @@
+     progress: Progress,
+     *,
+     refresh: bool = False,
++    reserve_end: int = 0,
++) -> Timeline:
++    if spec.voice and voice.stem != spec.voice:
++        progress(0, 0, "A voz do Kokoro está indisponível. Usando Cadu (Piper).")
++    try:
++        return _assemble(
++            script, spec, voice, cache, output, cancelled, progress, refresh, reserve_end
++        )
++    except VoiceFailure:
++        fallback = available_voices().get(FALLBACK) if voice.suffix == ".bin" else None
++        if fallback is None:
++            raise
++        progress(0, 0, "A narração Kokoro falhou. Nova tentativa com Cadu (Piper).")
++        return _assemble(
++            script, spec, fallback, cache, output, cancelled, progress, refresh, reserve_end
++        )
++
++
++def _assemble(
++    script: Script,
++    spec: StorySpec,
++    voice: Path,
++    cache: Path,
++    output: Path,
++    cancelled: Callable[[], bool],
++    progress: Progress,
++    refresh: bool,
++    reserve_end: int,
+ ) -> Timeline:
+     groups = phrase_groups(script)
+     if sum(len(phrase.split()) for group in groups for phrase in group) > spec.seconds * 4:
+@@ -180,17 +276,24 @@
+     if len(rates) != 1:
+         raise StoryError("As frases não usam a mesma taxa de amostragem. Regenere a narração.")
+     rate = rates.pop()
+-    intro, gap, outro = round(rate * 0.15), round(rate * 0.11), round(rate * 0.19)
++    intro, outro = round(rate * 0.15), round(rate * 0.19)
++    gaps = {phrase: round(rate * _gap_seconds(phrase)) for phrase in buffers}
+     minimum = [
+         intro
+         + outro
+-        + (len(group) - 1) * gap
++        + sum(gaps[phrase] for phrase in group[:-1])
+         + sum(len(buffers[phrase][1]) // 2 for phrase in group)
+         for group in groups
+     ]
+     total = spec.seconds * rate
+-    extra = total - sum(minimum)
++    reserved = reserve_end * rate
++    extra = total - reserved - sum(minimum)
+     if extra < 0:
++        if reserved:
++            raise StoryError(
++                f"A fala ocupa {sum(minimum) / rate:.1f} s e o final interativo reserva "
++                f"{reserve_end} s. Encurte a narração ou aumente a duração do vídeo."
++            )
+         raise StoryError(
+             f"A fala ocupa pelo menos {sum(minimum) / rate:.1f} s e o vídeo tem {spec.seconds} s. "
+             "Encurte as falas, aumente a velocidade ou escolha um vídeo mais longo."
+@@ -212,50 +315,111 @@
+                 cursor += len(data) // 2
+                 cues.append(Cue(start, cursor / rate, phrase))
+                 if j < len(group) - 1:
++                    gap = gaps[phrase]
+                     target.writeframesraw(b"\x00\x00" * gap)
+                     cursor += gap
+             elapsed += script.scenes[i].seconds
+             next_padding = extra if i == len(groups) - 1 else round(extra * elapsed / weight)
+             tail = outro + next_padding - allocated
++            if i == len(groups) - 1:
++                tail += reserved
+             target.writeframesraw(b"\x00\x00" * tail)
+             cursor += tail
+             allocated = next_padding
+             boundaries.append(cursor / rate)
++    timeline = Timeline(
++        boundaries, cues, voice.stem, spec.seconds - reserve_end if reserve_end else None
++    )
+     (output / "timeline.json").write_text(
+-        json.dumps(
+-            {"boundaries": boundaries, "cues": [asdict(cue) for cue in cues]}, ensure_ascii=False
+-        ),
+-        encoding="utf-8",
+-    )
+-    progress(len(fragments), len(fragments), "Narração medida e sincronizada")
+-    return Timeline(boundaries, cues)
+-
+-
+-def _piper_batch(voice_path: Path, request: Path) -> None:
++        json.dumps(asdict(timeline), ensure_ascii=False), encoding="utf-8"
++    )
++    progress(len(fragments), len(fragments), f"Narração medida e sincronizada · {engine(voice)}")
++    return timeline
++
++
++def sample_voice(voice: Path, speed: float, cache: Path) -> Path:
++    """Generate the same comparison text for each voice using the production worker."""
++    samples = cache / "voice-previews"
++    output = _fragment_path(samples, voice, speed, SAMPLE)
++    if output.is_file():
++        return output
++    samples.mkdir(parents=True, exist_ok=True)
++    phrases = _segments(SAMPLE)
++    parts = {text: _fragment_path(cache / "audio", voice, speed, text) for text in phrases}
++    synthesize(
++        voice,
++        speed,
++        {s: p for s, p in parts.items() if not p.is_file()},
++        lambda: False,
++        lambda _: None,
++    )
++    tracks = [_pcm(parts[text]) for text in phrases]
++    rate = tracks[0][0]
++    with NamedTemporaryFile(dir=samples, suffix=".wav", delete=False) as file:
++        temporary = Path(file.name)
++    try:
++        with wave.open(str(temporary), "wb") as target:
++            target.setparams((1, 2, rate, 0, "NONE", "not compressed"))
++            for index, (hz, data) in enumerate(tracks):
++                if hz != rate:
++                    raise VoiceFailure("As frases da amostra usam taxas de áudio diferentes.")
++                if index:
++                    target.writeframesraw(
++                        b"\x00\x00" * round(rate * _gap_seconds(phrases[index - 1]))
++                    )
++                target.writeframesraw(data)
++        temporary.replace(output)
++    finally:
++        temporary.unlink(missing_ok=True)
++    return output
++
++
++def _speech_engine(voice_path: Path, speed: float) -> tuple[int, Callable[[str], np.ndarray]]:
++    if voice_path.suffix == ".bin":
++        voice = kokoro.KokoroVoice(voice_path)
++        return kokoro.RATE, lambda text: voice.speak(text, speed)
++
+     from piper import PiperVoice, SynthesisConfig
+-    from piper.phonemize_espeak import ESPEAK_DATA_DIR
+-
++
++    piper = PiperVoice.load(voice_path, use_cuda=False, espeak_data_dir=kokoro.espeak_data())
++    settings = SynthesisConfig(length_scale=1 / speed, normalize_audio=False)
++
++    def speak(text: str) -> np.ndarray:
++        samples = [chunk.audio_float_array for chunk in piper.synthesize(text, syn_config=settings)]
++        return np.concatenate(samples) if samples else np.empty(0, dtype=np.float32)
++
++    return piper.config.sample_rate, speak
++
++
++def _level(samples: np.ndarray, rate: int) -> np.ndarray:
++    if not samples.size or not np.isfinite(samples).all():
++        raise VoiceFailure("A voz retornou áudio inválido.")
++    peak = float(np.max(np.abs(samples)))
++    active = np.flatnonzero(np.abs(samples) >= max(0.004, peak * 0.024))
++    if not active.size or peak < 0.008:
++        raise VoiceFailure("A voz retornou áudio sem fala detectável.")
++    margin = round(rate * 0.05)
++    start, end = int(active[0]), int(active[-1])
++    voice = samples[max(0, start - margin) : end + margin + 1]
++    rms = float(np.sqrt(np.mean(np.square(samples[active]))))
++    gain = min(0.125 / rms, 0.83 / peak, 4.0)
++    return np.rint(voice * (32767 * gain)).astype("<i2")
++
++
++def _speech_batch(voice_path: Path, request: Path) -> None:
+     voice_path, request = voice_path.resolve(), request.resolve()
+     task = json.loads(request.read_text(encoding="utf-8"))
+-    data = ESPEAK_DATA_DIR
+-    if os.name == "nt":
+-        # The eSpeak C library can reject accented absolute paths on Windows.
+-        # Use a relative path only in this worker, without changing Studio's cwd.
+-        os.chdir(data.parent)
+-        os.environ["ESPEAK_DATA_PATH"] = "."
+-        data = Path("espeak-ng-data")
+-    voice = PiperVoice.load(voice_path, use_cuda=False, espeak_data_dir=data)
+-    options = SynthesisConfig(length_scale=1 / task["speed"], volume=0.9)
++    rate, speak = _speech_engine(voice_path, task["speed"])
+     for count, (text, target) in enumerate(task["phrases"], start=1):
+         partial = request.parent / "frase.wav"
+         with wave.open(str(partial), "wb") as audio:
+-            voice.synthesize_wav(
+-                text.replace("[[", "").replace("]]", ""), audio, syn_config=options
+-            )
++            audio.setparams((1, 2, rate, 0, "NONE", "not compressed"))
++            pcm = _level(speak(text.replace("[[", "").replace("]]", "")), rate)
++            audio.writeframes(pcm.tobytes())
+         _pcm(partial)
+         partial.replace(target)
+-        print(f"piper_frases={count}", flush=True)
++        print(f"frases={count}", flush=True)
+ 
+ 
+ if __name__ == "__main__":
+-    _piper_batch(Path(sys.argv[1]), Path(sys.argv[2]))
++    _speech_batch(Path(sys.argv[1]), Path(sys.argv[2]))
+diff --git a/backend/autoclip/stories/render.py b/backend/autoclip/stories/render.py
+--- a/backend/autoclip/stories/render.py
++++ b/backend/autoclip/stories/render.py
+@@ -2,8 +2,10 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Callable
+-from contextlib import suppress
++import importlib.util
++import math
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager, suppress
+ from pathlib import Path
+ from tempfile import TemporaryDirectory
+ 
+@@ -12,9 +14,12 @@
+ 
+ from ..pipeline import Cancelled, ffmpeg
+ from . import art, narration
+-from .schema import FPS, HEIGHT, WIDTH, Script, StoryError, StorySpec
++from .cartoon3d import Stage
++from .geometry import Canvas
++from .schema import FPS, HEIGHT, WIDTH, EpisodeNotes, Script, StoryError, StorySpec
+ 
+ Report = Callable[[str, int, int, str], None]
++DrawFrame = Callable[[int, float, float], Image.Image]
+ 
+ 
+ def check_cancelled(cancelled: Callable[[], bool]) -> None:
+@@ -22,7 +27,7 @@
+         raise Cancelled("Geração de história cancelada.")
+ 
+ 
+-def _font() -> ImageFont.FreeTypeFont:
++def _font(size: int = 49) -> ImageFont.FreeTypeFont:
+     backend = Path(__file__).resolve().parents[1]
+     fonts = sorted((backend / "static" / "assets").glob("Archivo-Variable*.ttf"))
+     source = backend.parents[1] / "frontend" / "src" / "fonts" / "Archivo-Variable.ttf"
+@@ -30,13 +35,13 @@
+         fonts.append(source)
+     for font_path in [*fonts, "arialbd.ttf"]:
+         try:
+-            font = ImageFont.truetype(font_path, 49)
++            font = ImageFont.truetype(font_path, size)
+         except OSError:
+             continue
+         with suppress(OSError, ValueError):
+             font.set_variation_by_name("Bold")
+         return font
+-    return ImageFont.load_default(size=49)
++    return ImageFont.load_default(size=size)
+ 
+ 
+ def _caption(text: str, font: ImageFont.FreeTypeFont) -> Image.Image:
+@@ -83,6 +88,141 @@
+     return overlays
+ 
+ 
++def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int) -> list[str]:
++    rows: list[str] = []
++    line = ""
++    for word in text.split():
++        proposal = f"{line} {word}".strip()
++        if font.getlength(proposal) <= width:
++            line = proposal
++            continue
++        if line:
++            rows.append(line)
++        line = word
++        while font.getlength(line) > width:
++            bound = len(line) - 1
++            while font.getlength(line[:bound]) > width:
++                bound -= 1
++            rows.append(line[:bound])
++            line = line[bound:]
++    if line:
++        rows.append(line)
++    return rows
++
++
++def _ballot(notes: EpisodeNotes) -> Image.Image:
++    width = 596
++    question_font, label_font, plan_font = _font(42), _font(28), _font(33)
++    question = _wrap(notes.question, question_font, width - 64)
++    plans = [_wrap(text, plan_font, width - 112) for text in (notes.plan_a, notes.plan_b)]
++    heights = [50 + 40 * len(lines) for lines in plans]
++    height = 78 + len(question) * 52 + sum(heights)
++    overlay = Image.new("RGBA", (width, height))
++    draw = ImageDraw.Draw(overlay)
++    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=32, fill=(28, 30, 53, 245))
++    y = 23
++    for line in question:
++        draw.text((32, y), line, anchor="lt", font=question_font, fill="#fff9ed")
++        y += 52
++    y += 12
++    for label, lines, box, color in zip(
++        ("PLANO A", "PLANO B"), plans, heights, ("#c9e8df", "#f4dbef"), strict=True
++    ):
++        draw.rounded_rectangle((25, y, width - 25, y + box), radius=19, fill=color)
++        draw.text((51, y + 13), label, anchor="lt", font=label_font, fill="#353350")
++        for index, line in enumerate(lines):
++            draw.text((51, y + 48 + 40 * index), line, anchor="lt", font=plan_font, fill="#25263d")
++        y += box + 11
++    return overlay
++
++
++@contextmanager
++def _frames(
++    script: Script,
++    spec: StorySpec,
++    art_dir: Path,
++    cancelled: Callable[[], bool],
++    report: Report,
++) -> Iterator[DrawFrame]:
++    cast = {character.id: character for character in script.characters}
++    report("animacao", 0, len(script.scenes), "Preparando gestos, olhares e câmeras")
++    if spec.style == "cartoon-3d":
++        with Canvas((WIDTH, HEIGHT)) as canvas:
++            stage = Stage(canvas)
++            report("animacao", len(script.scenes), len(script.scenes), canvas.renderer)
++            yield lambda index, at, length: stage.frame(script.scenes[index], cast, at, length)
++        return
++
++    backgrounds, actors = [], []
++    for index, scene in enumerate(script.scenes, start=1):
++        check_cancelled(cancelled)
++        backgrounds.append(art.backdrop(art_dir, scene))
++        actors.append([art.actor(art_dir, cast[key], scene.mood) for key in scene.characters])
++        report("animacao", index, len(script.scenes), scene.title)
++    yield lambda index, at, length: art.frame(
++        script.scenes[index], backgrounds[index], actors[index], at, length
++    )
++
++
++def _write_frames(
++    draw: DrawFrame,
++    timeline: narration.Timeline,
++    folder: Path,
++    count: int,
++    fps: int,
++    cancelled: Callable[[], bool],
++    report: Report,
++    ballot: Image.Image | None,
++) -> None:
++    report("quadros", 0, count, "Renderizando os quadros da história")
++    scene_index = 0
++    previous, fade_from = None, None
++    for index in range(count):
++        check_cancelled(cancelled)
++        at = index / fps
++        while at >= timeline.boundaries[scene_index + 1]:
++            scene_index += 1
++            fade_from = previous
++        start, end = timeline.boundaries[scene_index : scene_index + 2]
++        elapsed = at - start
++        frame = draw(scene_index, elapsed, end - start)
++        if fade_from is not None and elapsed < 0.23:
++            frame = Image.blend(fade_from, frame, min(1.0, (elapsed + 0.04) / 0.23))
++        previous = frame
++        if ballot is not None and timeline.ballot_start is not None and at >= timeline.ballot_start:
++            frame = frame.copy()
++            frame.paste(ballot, (54, 241), ballot)
++        frame.save(folder / f"{index:05d}.png", compress_level=1)
++        if (index + 1) % fps == 0:
++            report("quadros", index + 1, count, "Renderizando os quadros da história")
++
++
++def _burn_captions(
++    timeline: narration.Timeline,
++    folder: Path,
++    output: Path,
++    count: int,
++    fps: int,
++    cancelled: Callable[[], bool],
++    report: Report,
++) -> None:
++    total = len(timeline.cues)
++    report("legendas", 0, total, "Sincronizando as frases com a voz usada")
++    overlays = _captions(timeline, output)
++    for index, cue in enumerate(timeline.cues, start=1):
++        start = math.ceil(cue.start * fps)
++        end = min(count, math.ceil(cue.end * fps))
++        for number in range(start, end):
++            check_cancelled(cancelled)
++            filename = folder / f"{number:05d}.png"
++            with Image.open(filename) as source:
++                frame = source.copy()
++            overlay = overlays[cue.text]
++            frame.paste(overlay, (0, 167), overlay)
++            frame.save(filename, compress_level=1)
++        report("legendas", index, total, "Tempos medidos do áudio")
++
++
+ def render_story(
+     script: Script,
+     spec: StorySpec,
+@@ -91,22 +231,23 @@
+     output: Path,
+     cancelled: Callable[[], bool],
+     report: Report,
++    *,
++    notes: EpisodeNotes | None = None,
+ ) -> ffmpeg.MediaInfo:
++    if issues := script.visual_issues():
++        raise StoryError("Resolva os elementos visuais no editor. " + " ".join(issues))
+     art_dir = cache / "art"
+-    characters = {character.id: character for character in script.characters}
+-    report("personagens", 0, len(characters), "Preparando fichas visuais")
+-    for i, character in enumerate(characters.values(), start=1):
++    total = len(script.characters) + len(script.scenes)
++    report("modelos", 0, total, "Preparando modelos e cenários")
++    if spec.style == "cartoon-3d" and importlib.util.find_spec("moderngl") is None:
++        raise StoryError("Instale o renderizador OpenGL com o atualizador ou selecione Cartoon 2D.")
++    for index, character in enumerate(script.characters, start=1):
+         check_cancelled(cancelled)
+-        art.reference(art_dir, character)
+-        report("personagens", i, len(characters), character.name)
+-
+-    report("cenarios", 0, len(script.scenes), "Preparando fundos reutilizáveis")
+-    backgrounds = []
+-    for i, scene in enumerate(script.scenes, start=1):
+-        check_cancelled(cancelled)
+-        backgrounds.append(art.backdrop(art_dir, scene))
+-        report("cenarios", i, len(script.scenes), scene.title)
+-
++        if spec.style == "cartoon-2d":
++            art.reference(art_dir, character)
++        report("modelos", index, total, character.name)
++    report("modelos", total, total, "Fichas e cenários prontos")
++    ballot = _ballot(notes) if notes and notes.question else None
+     timeline = narration.make_narration(
+         script,
+         spec,
+@@ -115,59 +256,24 @@
+         output,
+         cancelled,
+         lambda done, total, message: report("narracao", done, total, message),
++        reserve_end=notes.end_seconds if notes else 0,
+     )
+-    report("animacao", 0, len(script.scenes), "Preparando expressões, gestos e enquadramentos")
+-    actors = []
+-    for i, scene in enumerate(script.scenes, start=1):
+-        check_cancelled(cancelled)
+-        actors.append([art.actor(art_dir, characters[key], scene.mood) for key in scene.characters])
+-        report("animacao", i, len(script.scenes), scene.title)
+-
+-    report("legendas", 0, len(timeline.cues), "Preparando legendas por frase")
+-    overlays = _captions(timeline, output)
+-    report("legendas", len(timeline.cues), len(timeline.cues), "Tempos obtidos do áudio")
+-
+     final = output / "historia.mp4"
+     partial = output / "renderizando.mp4"
+     try:
+         with TemporaryDirectory(prefix="quadros-", dir=output) as working:
+             frames = Path(working)
+-            count = spec.seconds * FPS
+-            report("renderizacao", 0, count, "Desenhando quadros")
+-            scene_index, cue_index = 0, 0
+-            previous, fade_from = None, None
+-            for i in range(count):
+-                check_cancelled(cancelled)
+-                at = i / FPS
+-                if at >= timeline.boundaries[scene_index + 1]:
+-                    scene_index += 1
+-                    fade_from = previous
+-                start, end = timeline.boundaries[scene_index : scene_index + 2]
+-                elapsed = at - start
+-                frame = art.frame(
+-                    script.scenes[scene_index],
+-                    backgrounds[scene_index],
+-                    actors[scene_index],
+-                    elapsed,
+-                    end - start,
+-                )
+-                if fade_from is not None and elapsed < 0.23:
+-                    frame = Image.blend(fade_from, frame, min(1.0, (elapsed + 0.04) / 0.23))
+-                previous = frame.copy()
+-                while cue_index < len(timeline.cues) and at >= timeline.cues[cue_index].end:
+-                    cue_index += 1
+-                if cue_index < len(timeline.cues) and at >= timeline.cues[cue_index].start:
+-                    overlay = overlays[timeline.cues[cue_index].text]
+-                    frame.paste(overlay, (0, 167), overlay)
+-                frame.save(frames / f"{i:05d}.png", compress_level=1)
+-                if (i + 1) % FPS == 0:
+-                    report("renderizacao", i + 1, count, "Desenhando quadros")
++            fps = 24 if spec.style == "cartoon-3d" else FPS
++            count = spec.seconds * fps
++            with _frames(script, spec, art_dir, cancelled, report) as draw:
++                _write_frames(draw, timeline, frames, count, fps, cancelled, report, ballot)
++            _burn_captions(timeline, frames, output, count, fps, cancelled, report)
+             units = spec.seconds * 1000
+-            report("renderizacao", 0, units, "Codificando MP4")
++            report("codificacao", 0, units, "Codificando MP4")
+             ffmpeg.run(
+                 [
+                     "-framerate",
+-                    str(FPS),
++                    str(fps),
+                     "-start_number",
+                     "0",
+                     "-i",
+@@ -206,7 +312,7 @@
+                 ],
+                 total_duration_s=spec.seconds,
+                 on_progress=lambda fraction: report(
+-                    "renderizacao", round(fraction * units), units, "Codificando MP4"
++                    "codificacao", round(fraction * units), units, "Codificando MP4"
+                 ),
+                 cancelled=cancelled,
+             )
+diff --git a/backend/autoclip/stories/runner.py b/backend/autoclip/stories/runner.py
+--- a/backend/autoclip/stories/runner.py
++++ b/backend/autoclip/stories/runner.py
+@@ -6,7 +6,7 @@
+ 
+ from ..pipeline import Cancelled, ffmpeg
+ from . import narration, render, writer
+-from .schema import Script, StoryError, StorySpec, StoryTask
++from .schema import EpisodeNotes, Script, StoryError, StorySpec, StoryTask
+ from .store import Busy, StoryStore
+ 
+ log = logging.getLogger(__name__)
+@@ -65,6 +65,7 @@
+                 render.check_cancelled(cancelled)
+                 spec = StorySpec.model_validate(row["spec"])
+                 script = Script.model_validate(row["script"]) if row["script"] else None
++                notes = EpisodeNotes.model_validate(row["notes"])
+                 if operation.kind in {"roteiro", "cena"}:
+                     generated = await writer.write_story(
+                         spec,
+@@ -74,12 +75,14 @@
+                         ),
+                         script,
+                         operation.scene,
++                        self.store.continuity(project),
++                        notes.end_seconds,
+                     )
+                     render.check_cancelled(cancelled)
+                     self.store.end(project, run, "rascunho", script=generated)
+                 elif script is not None:
+                     await asyncio.to_thread(
+-                        self._produce_media, row, spec, script, operation, progress
++                        self._produce_media, row, spec, script, notes, operation, progress
+                     )
+             finally:
+                 self.workstation.release()
+@@ -102,17 +105,17 @@
+         row: dict,
+         spec: StorySpec,
+         script: Script,
++        notes: EpisodeNotes,
+         operation: StoryTask,
+         progress: render.Report,
+     ) -> None:
+         project, run = row["id"], row["run_id"]
+         cancelled = self.cancelled.is_set
+-        voice = narration.available_voices().get(spec.voice)
+-        if voice is None:
++        try:
++            voice = narration.select_voice(spec.voice)
++        except StoryError:
+             progress("narracao", 0, 0, "Aguardando uma voz local")
+-            raise StoryError(
+-                "Selecione uma voz pt-BR instalada. Use scripts/preparar-voz-historias.ps1."
+-            )
++            raise
+         output = self.store.output(project, run)
+         output.mkdir(parents=True)
+         cache = self.store.home / "cache"
+@@ -126,12 +129,15 @@
+                 cancelled,
+                 lambda done, total, message: progress("narracao", done, total, message),
+                 refresh=operation.refresh,
++                reserve_end=notes.end_seconds,
+             )
+             render.check_cancelled(cancelled)
+             self.store.end(project, run, "rascunho", audio=True)
+             return
+ 
+-        result = render.render_story(script, spec, voice, cache, output, cancelled, progress)
++        result = render.render_story(
++            script, spec, voice, cache, output, cancelled, progress, notes=notes
++        )
+         render.check_cancelled(cancelled)
+         self.store.end(
+             project,
+diff --git a/backend/autoclip/stories/schema.py b/backend/autoclip/stories/schema.py
+--- a/backend/autoclip/stories/schema.py
++++ b/backend/autoclip/stories/schema.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from math import ceil
+ from typing import Annotated, Literal
+ 
+ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+@@ -9,10 +10,20 @@
+ FPS = 12  # Draw on twos. Exports use 24 fps for browser and Reel compatibility.
+ 
+ Genre = Literal["misterio", "terror", "suspense", "humor", "reviravolta", "aventura"]
+-Species = Literal["cachorro", "gato", "coelho", "coruja", "robo"]
++Species = Literal["cachorro", "gato", "coelho", "coruja", "robo", "estrela", "pendente"]
++Style = Literal["cartoon-2d", "cartoon-3d"]
+ Setting = Literal["quarto", "bosque", "jardim", "oficina", "rua"]
+ Mood = Literal["calmo", "feliz", "surpreso", "assustado", "curioso", "triste"]
+-Motion = Literal["respirar", "acenar", "balancar_cabeca", "entrar", "sair", "pular"]
++Motion = Literal[
++    "respirar",
++    "acenar",
++    "balancar_cabeca",
++    "entrar",
++    "sair",
++    "pular",
++    "caminhar",
++    "observar",
++]
+ Prop = Literal["nenhum", "estrela", "chave", "bilhete", "lanterna", "livro", "semente", "bola"]
+ Reference = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,15}$")]
+ Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+@@ -28,9 +39,11 @@
+     genre: Genre = "misterio"
+     seconds: Literal[15, 30, 45, 60] = 15
+     model: Literal["qwen3:4b-instruct", "qwen2.5:7b"] = MODELS[0]
+-    style: Literal["cartoon-2d"] = "cartoon-2d"
++    style: Style = "cartoon-3d"
+     language: Literal["pt-BR"] = "pt-BR"
+-    voice: str = Field(default="", pattern=r"^(pt_BR-[A-Za-z0-9_-]{1,75})?$")
++    voice: str = Field(
++        default="", pattern=r"^(pt_BR-[A-Za-z0-9_-]{1,75}|pf_dora|pm_alex|pm_santa)?$"
++    )
+     speed: float = Field(default=1, ge=0.8, le=1.25)
+ 
+ 
+@@ -48,6 +61,12 @@
+     text: Text
+ 
+ 
++class Placement(StoryData):
++    character: Reference
++    position: Literal["esquerda", "centro", "direita"]
++    gaze: Literal["camera", "outro", "objeto", "janela"] = "camera"
++
++
+ class Scene(StoryData):
+     id: Reference
+     title: Title
+@@ -59,8 +78,11 @@
+     action: Text
+     mood: Mood
+     motion: Motion
++    motion_character: Reference | None = None
+     prop: Prop = "nenhum"
+-    shot: Literal["medio", "proximo"] = "medio"
++    shot: Literal["medio", "proximo", "aberto", "acompanhar"] = "medio"
++    placements: list[Placement] = Field(default_factory=list, max_length=2)
++    missing_assets: list[Title] = Field(default_factory=list, max_length=4)
+     seconds: float = Field(ge=1, le=30)
+ 
+     def validate_cast(self, cast: set[str]) -> None:
+@@ -69,6 +91,11 @@
+             raise ValueError("Cada personagem da cena deve aparecer uma vez na ficha da história.")
+         if any(line.speaker not in visible for line in self.dialogues):
+             raise ValueError("A fala precisa pertencer a um personagem presente na cena.")
++        positioned = {item.character for item in self.placements}
++        if len(positioned) != len(self.placements) or not positioned.issubset(visible):
++            raise ValueError("Defina uma posição para cada personagem presente, sem repetições.")
++        if self.motion_character is not None and self.motion_character not in visible:
++            raise ValueError("O movimento precisa pertencer a um personagem presente na cena.")
+ 
+ 
+ class Script(StoryData):
+@@ -91,6 +118,60 @@
+             scene.validate_cast(cast)
+         return self
+ 
++    def visual_issues(self) -> list[str]:
++        cast = {character.id: character for character in self.characters}
++        issues = []
++        for scene in self.scenes:
++            issues.extend(f"{scene.title} · Falta {asset}" for asset in scene.missing_assets)
++            if len({item.position for item in scene.placements}) != len(scene.placements):
++                issues.append(f"{scene.title} · Escolha posições diferentes para os personagens.")
++            for active in scene.characters:
++                if cast[active].species == "pendente":
++                    issues.append(f"{scene.title} · Escolha um modelo para {cast[active].name}.")
++            for place in scene.placements:
++                if place.gaze == "outro" and len(scene.characters) < 2:
++                    issues.append(
++                        f"{scene.title} · O olhar para outro personagem precisa de uma dupla."
++                    )
++                elif place.gaze == "objeto" and scene.prop == "nenhum":
++                    issues.append(
++                        f"{scene.title} · O olhar para o objeto precisa de um objeto em cena."
++                    )
++                elif place.gaze == "janela" and scene.setting not in {"quarto", "oficina"}:
++                    issues.append(f"{scene.title} · Escolha um cenário com janela ou mude o olhar.")
++        return issues
++
++
++class EpisodeNotes(StoryData):
++    summary: str = Field(default="", max_length=400)
++    events: str = Field(default="", max_length=400)
++    mysteries: str = Field(default="", max_length=400)
++    question: str = Field(default="", max_length=72)
++    plan_a: str = Field(default="", max_length=80)
++    plan_b: str = Field(default="", max_length=80)
++    vote: Literal["a", "b"] | None = None
++
++    @property
++    def choices(self) -> tuple[str, str, str]:
++        return self.question, self.plan_a, self.plan_b
++
++    @property
++    def end_seconds(self) -> int:
++        if not self.question:
++            return 0
++        words = sum(len(text.split()) for text in self.choices)
++        return max(4, min(8, ceil((words + 4) / 3)))
++
++    @model_validator(mode="after")
++    def validate_ballot(self) -> EpisodeNotes:
++        if any(self.choices) and not all(self.choices):
++            raise ValueError("Escreva a pergunta e os dois planos do final interativo.")
++        if self.question and self.plan_a.casefold() == self.plan_b.casefold():
++            raise ValueError("Escreva dois planos diferentes.")
++        if self.vote and not self.question:
++            raise ValueError("Salve os dois planos antes de registrar a votação.")
++        return self
++
+ 
+ class StoryTask(StoryData):
+     kind: Literal["roteiro", "cena", "audio", "render"]
+diff --git a/backend/autoclip/stories/store.py b/backend/autoclip/stories/store.py
+--- a/backend/autoclip/stories/store.py
++++ b/backend/autoclip/stories/store.py
+@@ -12,7 +12,7 @@
+ 
+ from .. import db, paths
+ from ..db.models import new_id
+-from .schema import Script, StoryError, StorySpec, StoryTask
++from .schema import EpisodeNotes, Script, StoryError, StorySpec, StoryTask
+ 
+ SCHEMA = """
+ CREATE TABLE IF NOT EXISTS projects (
+@@ -30,7 +30,8 @@
+     run_id TEXT,
+     audio_id TEXT,
+     export_id TEXT,
+-    updated_at TEXT NOT NULL
++    updated_at TEXT NOT NULL,
++    notes TEXT NOT NULL DEFAULT '{}'
+ );
+ CREATE UNIQUE INDEX IF NOT EXISTS one_story_generation ON projects(status) WHERE status='gerando';
+ CREATE TABLE IF NOT EXISTS exports (
+@@ -41,7 +42,21 @@
+     height INTEGER NOT NULL,
+     duration REAL NOT NULL,
+     size_bytes INTEGER NOT NULL,
+-    created_at TEXT NOT NULL
++    created_at TEXT NOT NULL,
++    style TEXT NOT NULL DEFAULT 'cartoon-2d'
++);
++CREATE TABLE IF NOT EXISTS series (
++    id TEXT PRIMARY KEY,
++    title TEXT NOT NULL,
++    cast TEXT NOT NULL,
++    style TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS series_episodes (
++    project_id TEXT PRIMARY KEY REFERENCES projects(id),
++    series_id TEXT NOT NULL REFERENCES series(id),
++    number INTEGER NOT NULL,
++    history TEXT NOT NULL DEFAULT '[]',
++    UNIQUE (series_id, number)
+ );
+ """
+ ID = re.compile(r"[0-9a-f]{16}")
+@@ -70,6 +85,17 @@
+     def initialize(self) -> None:
+         with self._connect() as connection:
+             connection.executescript(SCHEMA)
++        with self._connect(write=True) as connection:
++            columns = {row["name"] for row in connection.execute("PRAGMA table_info(exports)")}
++            if "style" not in columns:
++                connection.execute(
++                    "ALTER TABLE exports ADD COLUMN style TEXT NOT NULL DEFAULT 'cartoon-2d'"
++                )
++            columns = {row["name"] for row in connection.execute("PRAGMA table_info(projects)")}
++            if "notes" not in columns:
++                connection.execute(
++                    "ALTER TABLE projects ADD COLUMN notes TEXT NOT NULL DEFAULT '{}'"
++                )
+ 
+     def recover(self) -> None:
+         self.initialize()
+@@ -87,15 +113,60 @@
+         return row
+ 
+     @staticmethod
+-    def _read(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
++    def _series(connection: sqlite3.Connection, project: str) -> sqlite3.Row | None:
++        return connection.execute(
++            """SELECT e.series_id, e.number, e.history, s.title, s.cast, s.style,
++                      e.number=(SELECT MAX(number) FROM series_episodes
++                                WHERE series_id=e.series_id) AS latest
++               FROM series_episodes e JOIN series s ON e.series_id=s.id
++               WHERE e.project_id=?""",
++            (project,),
++        ).fetchone()
++
++    @staticmethod
++    def _check_cast(link: sqlite3.Row, style: str, script: Script) -> None:
++        cast = {item["id"]: item for item in json.loads(link["cast"])}
++        if (
++            style != link["style"]
++            or {item.id: item.model_dump() for item in script.characters} != cast
++        ):
++            raise StoryError("Use o estilo e as fichas de personagens definidos para a série.")
++
++    def _read(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
+         exported = connection.execute(
+             "SELECT * FROM exports WHERE id=?", (row["export_id"],)
+         ).fetchone()
+         info = dict(row)
+         for field in ("spec", "script", "task"):
+             info[field] = json.loads(info[field]) if info[field] else None
++        info["spec"].setdefault("style", "cartoon-2d")
++        script = Script.model_validate(info["script"]) if info["script"] else None
++        info["script"] = script.model_dump() if script else None
++        info["visual_issues"] = script.visual_issues() if script else []
++        legacy_stages = {"personagens": "modelos", "cenarios": "modelos", "renderizacao": "quadros"}
++        info["stage"] = legacy_stages.get(info["stage"], info["stage"])
+         info["approved"] = bool(info["approved"])
+         info["export"] = dict(exported) if exported else None
++        info["notes"] = EpisodeNotes.model_validate_json(row["notes"]).model_dump()
++        link = self._series(connection, row["id"])
++        info["series"] = None
++        if link:
++            history = json.loads(link["history"])
++            info["series"] = {
++                "id": link["series_id"],
++                "title": link["title"],
++                "number": link["number"],
++                "latest": bool(link["latest"]),
++                "previous": history[-1] if history else None,
++            }
++        info["audio_voice"] = None
++        if info["audio_id"]:
++            timeline = self.output(info["id"], info["audio_id"]) / "timeline.json"
++            try:
++                metadata = json.loads(timeline.read_text(encoding="utf-8"))
++                info["audio_voice"] = metadata.get("voice", info["spec"].get("voice"))
++            except (OSError, ValueError, AttributeError):
++                pass
+         return info
+ 
+     def get(self, project: str) -> dict:
+@@ -104,7 +175,11 @@
+ 
+     def projects(self) -> list[dict]:
+         with self._connect() as connection:
+-            rows = connection.execute("SELECT * FROM projects ORDER BY updated_at DESC")
++            rows = connection.execute(
++                """SELECT p.*, s.title AS series_title, e.number
++                   FROM projects p LEFT JOIN series_episodes e ON e.project_id=p.id
++                   LEFT JOIN series s ON e.series_id=s.id ORDER BY p.updated_at DESC"""
++            )
+             return [
+                 {
+                     "id": row["id"],
+@@ -113,6 +188,8 @@
+                     "title": json.loads(row["script"])["title"]
+                     if row["script"]
+                     else json.loads(row["spec"])["idea"],
++                    "series_title": row["series_title"],
++                    "episode_number": row["number"],
+                 }
+                 for row in rows
+             ]
+@@ -126,6 +203,125 @@
+             )
+         return self.get(project)
+ 
++    def save_notes(self, project: str, notes: EpisodeNotes) -> dict:
++        with self._connect(write=True) as connection:
++            row = self._row(connection, project)
++            if row["status"] == "gerando":
++                raise Busy("Aguarde ou cancele a produção para editar o episódio.")
++            before = EpisodeNotes.model_validate_json(row["notes"])
++            changed_choices = before.choices != notes.choices
++            link = self._series(connection, project)
++            if link and not link["latest"] and (changed_choices or before.vote != notes.vote):
++                raise StoryError("Este final já é usado em um episódio seguinte da série.")
++            if changed_choices and notes.vote:
++                raise StoryError("Salve os planos e depois registre a votação.")
++            if changed_choices:
++                connection.execute(
++                    """UPDATE projects SET status='rascunho', stage=NULL, completed=0, total=0,
++                       detail='', error=NULL, task=NULL, run_id=NULL, audio_id=NULL, export_id=NULL
++                       WHERE id=?""",
++                    (project,),
++                )
++            connection.execute(
++                "UPDATE projects SET notes=?, updated_at=? WHERE id=?",
++                (notes.model_dump_json(), _now(), project),
++            )
++        return self.get(project)
++
++    def start_series(self, project: str, title: str) -> dict:
++        with self._connect(write=True) as connection:
++            row = self._row(connection, project)
++            if row["status"] == "gerando" or self._series(connection, project):
++                raise Busy("Esta história está em produção ou já pertence a uma série.")
++            if not row["script"] or not row["approved"]:
++                raise StoryError("Revise e aprove o roteiro antes de iniciar uma série.")
++            script = Script.model_validate_json(row["script"])
++            if any(item.species == "pendente" for item in script.characters):
++                raise StoryError(
++                    "Escolha um modelo para todos os personagens antes de criar a série."
++                )
++            cast = [item.model_dump() for item in script.characters]
++            style = json.loads(row["spec"]).get("style", "cartoon-2d")
++            identity = new_id()
++            connection.execute(
++                "INSERT INTO series (id,title,cast,style) VALUES (?,?,?,?)",
++                (identity, title, json.dumps(cast, ensure_ascii=False), style),
++            )
++            connection.execute(
++                "INSERT INTO series_episodes (project_id,series_id,number) VALUES (?,?,1)",
++                (project, identity),
++            )
++            connection.execute("UPDATE projects SET updated_at=? WHERE id=?", (_now(), project))
++        return self.get(project)
++
++    def continue_series(self, project: str, idea: str) -> dict:
++        with self._connect(write=True) as connection:
++            row = self._row(connection, project)
++            link = self._series(connection, project)
++            if row["status"] == "gerando":
++                raise Busy("Aguarde a produção deste episódio.")
++            if not link or not link["latest"] or not row["script"] or not row["approved"]:
++                raise StoryError("Aprove o episódio mais recente da série antes de continuar.")
++            notes = EpisodeNotes.model_validate_json(row["notes"])
++            if notes.question and not notes.vote:
++                raise StoryError("Registre manualmente o resultado da votação antes de continuar.")
++            recent = connection.execute(
++                """SELECT e.number, p.script, p.notes FROM series_episodes e
++                   JOIN projects p ON p.id=e.project_id WHERE e.series_id=?
++                   ORDER BY e.number DESC LIMIT 4""",
++                (link["series_id"],),
++            ).fetchall()
++            history = []
++            for entry in reversed(recent):
++                prior = Script.model_validate_json(entry["script"])
++                recap = EpisodeNotes.model_validate_json(entry["notes"])
++                choice = {"a": recap.plan_a, "b": recap.plan_b}.get(recap.vote, "")
++                history.append(
++                    {
++                        "number": entry["number"],
++                        "title": prior.title,
++                        "summary": recap.summary or prior.synopsis,
++                        "events": recap.events,
++                        "mysteries": recap.mysteries,
++                        "settings": list(dict.fromkeys(scene.setting for scene in prior.scenes)),
++                        "ending": prior.ending,
++                        "chosen_plan": choice,
++                    }
++                )
++            data = json.loads(row["spec"])
++            data.update(
++                style=link["style"], idea=idea or "Continue a história a partir do último final."
++            )
++            spec = StorySpec.model_validate(data)
++            episode = new_id()
++            connection.execute(
++                "INSERT INTO projects (id,spec,updated_at) VALUES (?,?,?)",
++                (episode, spec.model_dump_json(), _now()),
++            )
++            connection.execute(
++                """INSERT INTO series_episodes (project_id,series_id,number,history)
++                   VALUES (?,?,?,?)""",
++                (
++                    episode,
++                    link["series_id"],
++                    link["number"] + 1,
++                    json.dumps(history, ensure_ascii=False),
++                ),
++            )
++        return self.get(episode)
++
++    def continuity(self, project: str) -> dict | None:
++        with self._connect() as connection:
++            link = self._series(connection, project)
++        if link is None:
++            return None
++        return {
++            "series": link["title"],
++            "episode": link["number"],
++            "characters": json.loads(link["cast"]),
++            "history": json.loads(link["history"]),
++        }
++
+     def save(self, project: str, spec: StorySpec, script: Script) -> dict:
+         if script.genre != spec.genre:
+             raise StoryError("O gênero do roteiro deve ser o mesmo do projeto.")
+@@ -133,13 +329,30 @@
+             before = self._row(connection, project)
+             if before["status"] == "gerando":
+                 raise Busy("Aguarde ou cancele a produção para editar este projeto.")
++            link = self._series(connection, project)
++            if link:
++                self._check_cast(link, spec.style, script)
+             new_spec, new_script = spec.model_dump_json(), script.model_dump_json()
+             if before["spec"] != new_spec or before["script"] != new_script:
+-                connection.execute(
+-                    """UPDATE projects SET spec=?, script=?, approved=0, status='rascunho',
++                prior_spec = json.loads(before["spec"])
++                prior_spec.setdefault("style", "cartoon-2d")
++                prior_script = (
++                    Script.model_validate_json(before["script"]).model_dump_json()
++                    if before["script"]
++                    else None
++                )
++                approved = (
++                    before["approved"]
++                    and prior_script == new_script
++                    and all(
++                        prior_spec.get(key) == getattr(spec, key) for key in ("style", "seconds")
++                    )
++                )
++                connection.execute(
++                    """UPDATE projects SET spec=?, script=?, approved=?, status='rascunho',
+                        stage=NULL, completed=0, total=0, detail='', error=NULL, audio_id=NULL,
+                        task=NULL, run_id=NULL, updated_at=? WHERE id=?""",
+-                    (new_spec, new_script, _now(), project),
++                    (new_spec, new_script, int(approved), _now(), project),
+                 )
+         return self.get(project)
+ 
+@@ -169,6 +382,12 @@
+                     raise StoryError("A cena não está mais neste roteiro.")
+                 if task.kind == "render" and not row["approved"]:
+                     raise StoryError("Aprove o roteiro antes de gerar o vídeo.")
++                if task.kind == "render":
++                    issues = Script.model_validate_json(row["script"]).visual_issues()
++                    if issues:
++                        raise StoryError(
++                            "Resolva as pendências visuais no editor. " + " ".join(issues)
++                        )
+                 connection.execute(
+                     """UPDATE projects SET status='gerando', stage='aguardando', completed=0,
+                        total=0, detail='', error=NULL, task=?, run_id=?, updated_at=? WHERE id=?""",
+@@ -205,10 +424,15 @@
+             row = self._row(connection, project)
+             if row["run_id"] != run or row["status"] != "gerando":
+                 return
++            style = json.loads(row["spec"]).get("style", "cartoon-2d")
++            if script is not None and (link := self._series(connection, project)):
++                self._check_cast(link, style, script)
+             if exported:
+                 connection.execute(
+-                    "INSERT INTO exports VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+-                    (run, project, *exported, _now()),
++                    """INSERT INTO exports (id, project_id, title, width, height,
++                                            duration, size_bytes, created_at, style)
++                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                    (run, project, *exported, _now(), style),
+                 )
+             connection.execute(
+                 """UPDATE projects SET status=?, updated_at=?, error=?, stage=?, detail='',
+diff --git a/backend/autoclip/stories/writer.py b/backend/autoclip/stories/writer.py
+--- a/backend/autoclip/stories/writer.py
++++ b/backend/autoclip/stories/writer.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import contextlib
++import json
+ from collections.abc import Callable
+ from urllib.parse import urlsplit
+ 
+@@ -13,12 +14,20 @@
+ from ..providers.ollama_provider import OllamaProvider
+ from .schema import MODELS, Scene, Script, StoryError, StorySpec
+ 
+-SYSTEM = """Escreva histórias fictícias originais em português do Brasil para cartoon 2D.
++SYSTEM = """Escreva histórias fictícias originais em português do Brasil para animação cartoon.
+ Entregue o JSON do esquema, sem markdown. Faça começo, desenvolvimento e final narrados.
+ Use palavras simples, frases naturais e elementos que a biblioteca consegue desenhar.
+ IDs distintos como c1, c2 e s1, s2; reutilize o ID em todas as aparições do personagem.
+-Narre visualmente o que importa. 'action' descreve o acontecimento e 'motion' escolhe
+-o gesto que o desenho consegue realizar. 'prop' é um objeto visível ou 'nenhum'.
++Use os mesmos IDs, espécies e acessórios em todas as cenas.
++Use estrela como espécie quando for personagem com rosto e reações; prop é objeto visível.
++Quando não há objeto no texto, escolha prop 'nenhum'. Não invente chaves ou outros objetos.
++Se um modelo solicitado não existe no esquema, use espécie 'pendente' e mantenha o nome
++do personagem. Descreva cenários ou objetos indisponíveis em missing_assets; não improvise.
++Alinhe action, motion e shot com a fala. Exemplo: observar pela janela usa quarto ou oficina,
++motion 'observar' e gaze 'janela' no personagem; use light 'noite' se a ação se passa à noite.
++Ao interagir, use gaze 'outro' somente com dois personagens e gaze 'objeto' quando houver prop.
++Para uma dupla use placements com esquerda e direita, ou deixe a lista vazia.
++Em motion_character informe o ID de quem realiza o movimento descrito na ação.
+ Use cores hexadecimais suaves para a ficha visual. Não imite personagens conhecidos.
+ Omita os diálogos ou use uma lista vazia se a narração já for suficiente."""
+ 
+@@ -82,15 +91,19 @@
+     attempt: Callable[[int], None],
+     script: Script | None = None,
+     scene_id: str | None = None,
++    continuity: dict | None = None,
++    ballot_seconds: int = 0,
+ ) -> Script:
+     local = provider(spec.model)
+     schema = Scene if script is not None and scene_id is not None else Script
+     count = {15: 3, 30: 4, 45: 5, 60: 6}[spec.seconds]
+-    limit = int(spec.seconds * 2.0)
++    limit = int((spec.seconds - ballot_seconds) * 2.0)
+     max_per_scene = limit // count
+     if schema is Scene and script is not None:
+         original = next(scene for scene in script.scenes if scene.id == scene_id)
+-        budget = max(6, int(original.seconds * 1.9))
++        budget = max(
++            5, int(original.seconds * 1.9 * (spec.seconds - ballot_seconds) / spec.seconds)
++        )
+         prompt = (
+             f"Reescreva só a cena {scene_id}, com o mesmo ID e personagens existentes. "
+             f"Use até {budget} palavras faladas, incluindo diálogos. Preserve o arco.\n"
+@@ -98,13 +111,23 @@
+         )
+     else:
+         prompt = (
+-            f"Ideia original: {spec.idea}\nGênero: {spec.genre}. "
++            f"Ideia original: {spec.idea}\nGênero: {spec.genre}. Estilo: {spec.style}. "
+             f"São exatamente {count} cenas e {spec.seconds} segundos. Cada 'narration' "
+             f"tem UMA frase curta de até {max_per_scene} palavras. Deixe 'dialogues' vazio. "
+             f"No máximo {limit} palavras faladas no vídeo todo. "
+             "O final precisa aparecer na última narração. "
+             "Use de um a três personagens. Os segundos estimados somam a duração escolhida."
+         )
++        if ballot_seconds:
++            prompt += f" Reserve {ballot_seconds} segundos em silêncio para as opções finais."
++        if continuity:
++            canon = json.dumps(continuity, ensure_ascii=False)
++            prompt += (
++                "\nSérie: use exclusivamente os IDs das fichas recebidas. Se houver histórico, "
++                "comece no final do episódio anterior, siga o plano escolhido manualmente "
++                "quando presente e preserve os mistérios ainda abertos. Reuse os cenários "
++                f"quando fizer sentido. Não decida votações. Continuidade: {canon}"
++            )
+ 
+     feedback = ""
+     for number in (1, 2):
+@@ -122,9 +145,26 @@
+         }
+         if spec.model.startswith("qwen3:"):
+             payload["think"] = False
++        if continuity:
++            payload["options"]["num_ctx"] = 8192
+         output = await _generation(local.url, payload, cancelled)
+         try:
+-            generated = schema.model_validate_json(output)
++            if schema is Script:
++                data = json.loads(output)
++                if not isinstance(data, dict):
++                    feedback = "\nA resposta precisa ser um objeto JSON."
++                    continue
++                if continuity:
++                    data["characters"] = continuity["characters"]
++                scenes = data.get("scenes")
++                if isinstance(scenes, list):
++                    data["scenes"] = [
++                        dict(scene, id=f"s{index}") if isinstance(scene, dict) else scene
++                        for index, scene in enumerate(scenes, start=1)
++                    ]
++                generated = Script.model_validate(data)
++            else:
++                generated = schema.model_validate_json(output)
+             if isinstance(generated, Scene) and script is not None:
+                 if _words(generated) > budget + 3:
+                     feedback = f"\nEncurte a narração e falas para até {budget} palavras."
+@@ -149,6 +189,8 @@
+             first = error.errors(include_input=False, include_url=False, include_context=False)[0]
+             field = ".".join(map(str, first["loc"]))
+             feedback = f"\nRevise o JSON e as referências. Campo inválido: {field or 'roteiro'}."
++        except json.JSONDecodeError:
++            feedback = "\nRetorne apenas o objeto JSON descrito pelo esquema."
+     raise StoryError(
+         "O Ollama devolveu um roteiro inválido duas vezes. Simplifique a ideia e tente de novo."
+     )
+diff --git a/frontend/src/pages/Stories.tsx b/frontend/src/pages/Stories.tsx
+--- a/frontend/src/pages/Stories.tsx
++++ b/frontend/src/pages/Stories.tsx
+@@ -5,14 +5,15 @@
+ import { ErrorNote } from '../components/ErrorNote'
+ import { Icon } from '../components/Icon'
+ import {
+-  GENRES, STAGES, STATUS, stories,
++  GENRES, STAGES, STATUS, STYLES, stories, voiceName,
+   type Script, type StoryOptions, type StoryProject, type StorySpec, type StorySummary,
+ } from '../stories'
+ import { Duration, Editor, Select, Voice } from './story/Editor'
++import { Episode } from './story/Episode'
+ 
+ const INITIAL: StorySpec = {
+   idea: '', genre: 'misterio', seconds: 15, model: 'qwen3:4b-instruct',
+-  style: 'cartoon-2d', language: 'pt-BR', voice: '', speed: 1,
++  style: 'cartoon-3d', language: 'pt-BR', voice: '', speed: 1,
+ }
+ const STEPS = Object.entries(STAGES)
+ 
+@@ -73,8 +74,9 @@
+   )
+ }
+ 
+-function Result({ project, options, canGenerate, canNarrate, onRender, onAudio }: {
++function Result({ project, style, options, canGenerate, canNarrate, onRender, onAudio }: {
+   project: StoryProject | null; options: StoryOptions | null; canGenerate: boolean; canNarrate: boolean
++  style: StorySpec['style']
+   onRender: () => void; onAudio: (refresh: boolean) => void
+ }) {
+   const exported = project?.export
+@@ -89,14 +91,14 @@
+           <video key={exported.id} className="story-video" src={stories.video(exported.id)} controls playsInline preload="metadata"
+             aria-label={'Prévia de ' + exported.title} />
+         ) : (
+-          <img className="story-video" src={stories.stylePreview} alt="Exemplo de cartoon 2D com um coelho e uma coruja em um jardim noturno" />
++          <img className="story-video" src={stories.stylePreview(style)} alt={'Exemplo de ' + STYLES[style]} />
+         )}
+       </div>
+       {exported && (
+         <div className="mt-4">
+           <h3 className="break-words text-base font-bold">{exported.title}</h3>
+           <p className="mt-1 text-sm text-ink-500">
+-            {exported.duration.toLocaleString('pt-BR', { maximumFractionDigits: 2 })} s · {exported.width} × {exported.height} · {formatBytes(exported.size_bytes)}
++            {STYLES[exported.style]} · {exported.duration.toLocaleString('pt-BR', { maximumFractionDigits: 2 })} s · {exported.width} × {exported.height} · {formatBytes(exported.size_bytes)}
+           </p>
+           <div className="mt-3 flex flex-wrap gap-2">
+             <a className="btn btn-primary" href={stories.video(exported.id, true)}>Baixar MP4</a>
+@@ -117,8 +119,13 @@
+             </select>
+           </label>
+           {project.audio_id && (
+-            <audio key={project.audio_id} src={stories.audio(project.id, project.audio_id)} controls preload="metadata"
+-              aria-label="Prévia da narração" className="w-full" />
++            <div className="grid gap-1.5">
++              {project.audio_voice && <p className="text-sm text-ink-500">
++                Voz usada · {voiceName(project.audio_voice)}{project.audio_voice !== project.spec.voice ? ' (reserva)' : ''}
++              </p>}
++              <audio key={project.audio_id} src={stories.audio(project.id, project.audio_id)} controls preload="metadata"
++                aria-label="Prévia da narração" className="w-full" />
++            </div>
+           )}
+           <div className="flex flex-wrap gap-2">
+             <button type="button" className="btn btn-ghost" disabled={!canNarrate} onClick={() => onAudio(!!project.audio_id)}>
+@@ -244,7 +251,10 @@
+   async function save() {
+     if (project && script && dirty) accept(await stories.save(project.id, spec, script))
+   }
+-  const hasVoice = !!options?.voices.includes(spec.voice)
++  const hasVoice = !!options && (
++    options.voices.includes(spec.voice)
++    || (['pf_dora', 'pm_alex', 'pm_santa'].includes(spec.voice) && options.voices.includes('pt_BR-cadu-medium'))
++  )
+   const productionAvailable = !busy && !working && !otherWorking
+   const production = project && <Production project={project} busy={busy || otherWorking}
+     onCancel={() => void perform(() => stories.cancel(project.id))}
+@@ -264,7 +274,10 @@
+               <select className="field max-w-[min(73vw,17rem)] text-sm font-normal" value={selected} disabled={busy}
+                 onChange={(e) => goTo(e.target.value)}>
+                 <option value="">Nova história</option>
+-                {projects.map((item) => <option key={item.id} value={item.id}>{item.title.slice(0, 55)} · {STATUS[item.status]}</option>)}
++                {projects.map((item) => <option key={item.id} value={item.id}>
++                  {item.series_title ? 'Ep. ' + item.episode_number + ' · ' + item.series_title.slice(0, 24) + ' · ' : ''}
++                  {item.title.slice(0, item.series_title ? 32 : 55)} · {STATUS[item.status]}
++                </option>)}
+               </select>
+             </label>
+           )}
+@@ -312,11 +325,10 @@
+                 <div className="grid gap-3 sm:grid-cols-2">
+                   <Select label="Gênero" value={form.genre} values={GENRES} onChange={(genre) => setForm({ ...form, genre })} />
+                   <Duration value={form.seconds} onChange={(seconds) => setForm({ ...form, seconds })} />
+-                  <Select label="Estilo visual" value={form.style} values={{ 'cartoon-2d': 'Cartoon 2D minimalista' }}
++                  <Select label="Estilo visual" value={form.style} values={STYLES}
+                     onChange={(style) => setForm({ ...form, style })} />
+                   <Select label="Idioma" value={form.language} values={{ 'pt-BR': 'Português brasileiro' }}
+                     onChange={(language) => setForm({ ...form, language })} />
+-                  <Voice value={form.voice} options={options} onChange={(voice) => setForm({ ...form, voice })} />
+                   <label className="grid gap-1.5 text-sm font-semibold">
+                     Modelo do Ollama
+                     <select className="field font-normal" value={options?.models.includes(form.model) ? form.model : ''}
+@@ -326,6 +338,8 @@
+                     </select>
+                   </label>
+                 </div>
++                <Voice value={form.voice} speed={form.speed} options={options}
++                  onChange={(voice) => setForm({ ...form, voice })} onSpeed={(speed) => setForm({ ...form, speed })} />
+                 <button type="submit" className="btn btn-primary justify-self-start"
+                   disabled={!productionAvailable || form.idea.trim().length < 4 || !options?.models.length}>
+                   <Icon name="stories" width="17" height="17" /> Gerar roteiro
+@@ -334,6 +348,12 @@
+             </section>
+           )}
+ 
++          {project && (project.script || project.series) && (
++            <Episode key={project.id} project={project} busy={busy || working} dirty={dirty}
++              onSave={(notes) => void perform(async () => setProject(await stories.saveEpisode(project.id, notes)))}
++              onStart={(title) => void perform(async () => setProject(await stories.startSeries(project.id, title)))}
++              onContinue={(idea) => void perform(async () => goTo((await stories.continueSeries(project.id, idea)).id))} />
++          )}
+           {otherWorking && <p role="status" className="rounded-lg border border-ink-800 bg-ink-850 p-3 text-sm text-ink-500">Há outro projeto em produção.</p>}
+           {options && (options.ollama_problem || !options.voices.length) && (
+             <section className="panel p-4 sm:p-5" aria-label="Configuração dos serviços locais">
+@@ -350,9 +370,9 @@
+         </div>
+         <div className={'grid min-w-0 gap-4 ' + (working ? 'order-first xl:order-none' : '')}>
+           {working && production}
+-          <Result project={project} options={options}
++          <Result project={project} style={project?.spec.style ?? form.style} options={options}
+             canNarrate={productionAvailable && hasVoice}
+-            canGenerate={productionAvailable && hasVoice && !!project?.approved && !dirty}
++            canGenerate={productionAvailable && hasVoice && !!project?.approved && !dirty && !project.visual_issues.length}
+             onAudio={(refresh) => {
+               if (!project) return
+               void perform(async () => { await save(); accept(await stories.task(project.id, { kind: 'audio', refresh })) })
+diff --git a/frontend/src/pages/story/Editor.tsx b/frontend/src/pages/story/Editor.tsx
+--- a/frontend/src/pages/story/Editor.tsx
++++ b/frontend/src/pages/story/Editor.tsx
+@@ -1,21 +1,23 @@
+-import { useState } from 'react'
++import { useEffect, useState } from 'react'
+ 
+ import { Icon } from '../../components/Icon'
+ import {
+-  ACCESSORIES, DURATION, LIGHT, MOODS, MOTIONS, PROPS, SETTINGS, SHOTS, SPECIES, stories, voiceName,
+-  type Character, type Scene, type Script, type StoryOptions, type StoryProject, type StorySpec,
++  ACCESSORIES, DURATION, GAZES, LIGHT, MOODS, MOTIONS, POSITIONS, PROPS, SETTINGS, SHOTS, SPECIES,
++  STYLES, stories, voiceName,
++  type Character, type Placement, type Scene, type Script, type StoryOptions, type StoryProject, type StorySpec,
+ } from '../../stories'
+ 
+-export function Select<K extends string>({ label, value, values, onChange }: {
++export function Select<K extends string>({ label, value, values, onChange, disabled }: {
+   label: string
+   value: K
+   values: Record<K, string>
+   onChange: (value: K) => void
++  disabled?: boolean
+ }) {
+   return (
+     <label className="grid gap-1.5 text-sm font-semibold">
+       {label}
+-      <select className="field font-normal" value={value} onChange={(e) => onChange(e.target.value as K)}>
++      <select className="field font-normal" value={value} disabled={disabled} onChange={(e) => onChange(e.target.value as K)}>
+         {Object.entries(values).map(([key, title]) => <option key={key} value={key}>{title as string}</option>)}
+       </select>
+     </label>
+@@ -33,19 +35,74 @@
+   )
+ }
+ 
+-export function Voice({ value, options, onChange }: {
++export function Voice({ value, speed, options, onChange, onSpeed }: {
+   value: string; options: StoryOptions | null; onChange: (value: string) => void
++  speed: number; onSpeed: (speed: number) => void
+ }) {
+-  const available = options?.voices ?? []
+-  return (
+-    <label className="grid gap-1.5 text-sm font-semibold">
+-      Narrador
+-      <select className="field font-normal" value={value} onChange={(e) => onChange(e.target.value)}>
+-        <option value="">Escolha uma voz pt-BR</option>
+-        {value && !available.includes(value) && <option value={value} disabled>{voiceName(value)} indisponível</option>}
+-        {available.map((voice) => <option key={voice} value={voice}>{voiceName(voice)}</option>)}
+-      </select>
+-    </label>
++  const available = options?.voice_profiles ?? []
++  const current = available.find((voice) => voice.id === value)
++  const engine = current?.engine ?? (value.startsWith('p') && !value.startsWith('pt_BR-') ? 'Kokoro' : 'Piper')
++  const choices = available.filter((voice) => voice.engine === engine)
++  const [sample, setSample] = useState<{ voice: string; speed: number; id: string } | null>(null)
++  const [busy, setBusy] = useState(false)
++  const [problem, setProblem] = useState('')
++  useEffect(() => { setProblem('') }, [value, speed])
++
++  async function listen() {
++    setBusy(true)
++    setProblem('')
++    try {
++      const { id } = await stories.previewVoice(value, speed)
++      setSample({ voice: value, speed, id })
++    } catch (error) {
++      setProblem((error as Error).message)
++    } finally {
++      setBusy(false)
++    }
++  }
++  return (
++    <div className="grid gap-3 rounded-xl border border-ink-800 p-3 sm:p-4">
++      <div className="grid gap-3 sm:grid-cols-3">
++        <label className="grid gap-1.5 text-sm font-semibold">
++          Motor de narração
++          <select className="field font-normal" value={engine} onChange={(e) => {
++            const first = available.find((voice) => voice.engine === e.target.value)
++            if (first) onChange(first.id)
++          }}>
++            {(['Kokoro', 'Piper'] as const).map((item) => (
++              <option key={item} disabled={!available.some((voice) => voice.engine === item)}>{item}</option>
++            ))}
++          </select>
++        </label>
++        <label className="grid gap-1.5 text-sm font-semibold">
++          Voz pt-BR
++          <select className="field font-normal" value={value} onChange={(e) => onChange(e.target.value)}>
++            {!value && <option value="">Escolha uma voz</option>}
++            {value && !current && <option value={value} disabled>{voiceName(value)} indisponível</option>}
++            {choices.map((voice) => <option key={voice.id} value={voice.id}>{voice.name}</option>)}
++          </select>
++        </label>
++        <label className="grid gap-1.5 text-sm font-semibold">
++          Velocidade da voz
++          <select className="field font-normal" value={speed} onChange={(e) => onSpeed(Number(e.target.value))}>
++            {[...new Set([0.8, 0.9, 1, 1.05, 1.15, 1.25, speed])].sort().map((item) =>
++              <option key={item} value={item}>{item.toLocaleString('pt-BR')}×</option>)}
++          </select>
++        </label>
++      </div>
++      <div className="flex flex-wrap items-center gap-2">
++        <button type="button" className="btn btn-ghost" disabled={busy || !current}
++          onClick={() => void listen()}>{busy ? 'Gerando amostra…' : 'Ouvir voz'}</button>
++        {sample && sample.voice === value && sample.speed === speed && (
++          <audio key={sample.id} src={stories.sample(sample.id)} controls autoPlay preload="metadata"
++            aria-label={'Amostra de ' + voiceName(value)} className="min-w-0 max-w-full" />
++        )}
++      </div>
++      {problem && <p className="text-sm text-signal-bad" role="alert">{problem}</p>}
++      {options && !available.some((voice) => voice.engine === 'Kokoro') && (
++        <p className="text-xs text-ink-500">Para instalar as vozes Kokoro, execute <code>preparar-voz-historias.ps1 -Kokoro</code>.</p>
++      )}
++    </div>
+   )
+ }
+ 
+@@ -60,11 +117,13 @@
+   return (
+     <article className="grid gap-3 rounded-xl border border-ink-800 p-3 sm:grid-cols-[7rem_minmax(0,1fr)]">
+       <div className="grid place-items-center self-start overflow-hidden rounded-lg bg-ink-850">
+-        <img className="aspect-square w-full max-w-36 object-contain" src={stories.reference(project.id, character.id, project.updated_at)}
+-          alt={'Ficha visual salva de ' + character.name} loading="lazy" />
++        {saved?.species === 'pendente'
++          ? <p className="p-3 text-center text-xs text-signal-bad">Escolha um modelo</p>
++          : <img className="aspect-square w-full max-w-36 object-contain" src={stories.reference(project.id, character.id, project.updated_at)}
++              alt={'Ficha visual salva de ' + character.name} loading="lazy" />}
+         {previewPending && <p className="p-2 text-center text-xs text-ink-500">Salve para atualizar a ficha.</p>}
+       </div>
+-      <div className="grid gap-3">
++      <fieldset disabled={!!project.series} className="grid min-w-0 gap-3">
+         <div className="grid gap-3 sm:grid-cols-2">
+           <label className="grid gap-1.5 text-sm font-semibold">
+             Nome
+@@ -82,17 +141,31 @@
+           Descrição visual
+           <input className="field font-normal" maxLength={100} value={character.visual} onChange={(e) => change({ visual: e.target.value })} />
+         </label>
+-        <button type="button" className="btn btn-ghost justify-self-start" onClick={() => {
++        {!project.series && <button type="button" className="btn btn-ghost justify-self-start" onClick={() => {
+           const index = colors.indexOf(character.color.toLowerCase())
+           change({ color: colors[(index + 1) % colors.length] })
+-        }}>Variar visual</button>
+-      </div>
++        }}>Variar visual</button>}
++      </fieldset>
+     </article>
+   )
+ }
+ 
+ function SceneFields({ scene, script, onChange }: { scene: Scene; script: Script; onChange: (scene: Scene) => void }) {
+   const change = (patch: Partial<Scene>) => onChange({ ...scene, ...patch })
++  const position = (id: string) => scene.placements.find((item) => item.character === id)
++  const anchors = (id: string) => Object.fromEntries(
++    Object.entries(POSITIONS)
++      .filter(([key]) => !scene.placements.some((item) => item.character !== id && item.position === key)),
++  ) as Record<Placement['position'], string>
++  function setPlacement(id: string, detail: Partial<Placement>) {
++    const current = position(id)
++    const free = Object.keys(anchors(id)) as Placement['position'][]
++    const fallback = scene.characters.length === 1 ? 'centro' : scene.characters[0] === id ? 'esquerda' : 'direita'
++    const updated: Placement = {
++      character: id, gaze: 'camera', position: free.includes(fallback) ? fallback : free[0], ...current, ...detail,
++    }
++    change({ placements: [...scene.placements.filter((item) => item.character !== id), updated] })
++  }
+   return (
+     <div className="grid gap-3 rounded-xl border border-ink-800 p-3 sm:p-4">
+       <label className="grid gap-1.5 text-sm font-semibold">
+@@ -114,9 +187,20 @@
+         <Select label="Luz" values={LIGHT} value={scene.light} onChange={(light) => change({ light })} />
+         <Select label="Expressão" values={MOODS} value={scene.mood} onChange={(mood) => change({ mood })} />
+         <Select label="Movimento" values={MOTIONS} value={scene.motion} onChange={(motion) => change({ motion })} />
++        {scene.characters.length > 1 && <Select label="Quem se movimenta" value={scene.motion_character ?? scene.characters[0]}
++          values={Object.fromEntries(script.characters.filter((item) => scene.characters.includes(item.id)).map((item) => [item.id, item.name]))}
++          onChange={(motion_character) => change({ motion_character })} />}
+         <Select label="Objeto em cena" values={PROPS} value={scene.prop} onChange={(prop) => change({ prop })} />
+         <Select label="Enquadramento" values={SHOTS} value={scene.shot} onChange={(shot) => change({ shot })} />
+       </div>
++      {scene.missing_assets.length > 0 && <div className="grid gap-2 rounded-lg bg-ink-850 p-3 text-sm" role="alert">
++        <p className="font-semibold text-signal-bad">Elementos sem modelo na biblioteca</p>
++        {scene.missing_assets.map((item, index) => <div className="flex flex-wrap items-center justify-between gap-1" key={index}>
++          <span>{item}</span>
++          <button type="button" className="btn btn-quiet"
++            onClick={() => change({ missing_assets: scene.missing_assets.filter((_, i) => i !== index) })}>Marcar como resolvido</button>
++        </div>)}
++      </div>}
+       <div className="flex flex-wrap items-center gap-3 text-sm">
+         <span className="font-semibold">Em cena</span>
+         {script.characters.map((character) => {
+@@ -127,13 +211,37 @@
+                 disabled={included ? scene.characters.length === 1 : scene.characters.length === 2}
+                 onChange={(e) => {
+                   const characters = e.target.checked ? [...scene.characters, character.id] : scene.characters.filter((id) => id !== character.id)
+-                  change({ characters, dialogues: scene.dialogues.filter((line) => characters.includes(line.speaker)) })
++                  const placements = scene.placements.filter((item) => characters.includes(item.character))
++                    .map((item): Placement => characters.length === 1 && item.gaze === 'outro' ? { ...item, gaze: 'camera' } : item)
++                  const motion_character = scene.motion_character && characters.includes(scene.motion_character) ? scene.motion_character : null
++                  change({ characters, placements, motion_character, dialogues: scene.dialogues.filter((line) => characters.includes(line.speaker)) })
+                 }} />
+               {character.name}
+             </label>
+           )
+         })}
+       </div>
++      <details className="rounded-lg bg-ink-900 p-3 text-sm">
++        <summary className="cursor-pointer font-semibold">Posição e olhar</summary>
++        {scene.characters.map((id) => {
++          const name = script.characters.find((item) => item.id === id)?.name ?? id
++          const pose = position(id)
++          const gaze = Object.fromEntries(Object.entries(GAZES).filter(([key]) =>
++            (key !== 'outro' || scene.characters.length === 2)
++            && (key !== 'objeto' || scene.prop !== 'nenhum')
++            && (key !== 'janela' || ['quarto', 'oficina'].includes(scene.setting)),
++          )) as Record<Placement['gaze'], string>
++          return <div key={id} className="mt-3 grid gap-2 sm:grid-cols-2">
++            <Select label={'Posição · ' + name} value={pose?.position ?? 'auto'}
++              values={{ auto: 'Automática', ...(pose ? { [pose.position]: POSITIONS[pose.position] } : {}), ...anchors(id) }}
++              onChange={(value) => value === 'auto'
++                ? change({ placements: scene.placements.filter((item) => item.character !== id) })
++                : setPlacement(id, { position: value })} />
++            <Select label={'Olhar · ' + name} value={pose?.gaze ?? 'camera'} values={{ ...(pose ? { [pose.gaze]: GAZES[pose.gaze] } : {}), ...gaze }}
++              onChange={(value) => setPlacement(id, { gaze: value })} />
++          </div>
++        })}
++      </details>
+       <details className="rounded-lg bg-ink-900 p-3 text-sm">
+         <summary className="cursor-pointer font-semibold">Diálogos{scene.dialogues.length ? ' · ' + scene.dialogues.length : ''}</summary>
+         {scene.dialogues.map((line, index) => (
+@@ -182,24 +290,27 @@
+           <textarea className="field min-h-16 resize-y font-normal" maxLength={400} value={script.synopsis}
+             onChange={(e) => onScript({ ...script, synopsis: e.target.value })} />
+         </label>
+-        <div className="grid gap-3 sm:grid-cols-3">
++        <div className="grid gap-3 sm:grid-cols-2">
+           <Duration value={spec.seconds} onChange={(seconds) => onSpec({ ...spec, seconds })} />
+-          <Voice value={spec.voice} options={options} onChange={(voice) => onSpec({ ...spec, voice })} />
+-          <label className="grid gap-1.5 text-sm font-semibold">
+-            Velocidade do narrador
+-            <select className="field font-normal" value={spec.speed} onChange={(e) => onSpec({ ...spec, speed: Number(e.target.value) })}>
+-              {[...new Set([0.8, 0.9, 1, 1.05, 1.15, 1.25, spec.speed])].sort().map((speed) =>
+-                <option key={speed} value={speed}>{speed.toLocaleString('pt-BR')}×</option>)}
+-            </select>
+-          </label>
++          <Select label="Estilo visual" value={spec.style} values={STYLES} disabled={!!project.series}
++            onChange={(style) => onSpec({ ...spec, style })} />
+         </div>
++        <Voice value={spec.voice} speed={spec.speed} options={options}
++          onChange={(voice) => onSpec({ ...spec, voice })} onSpeed={(speed) => onSpec({ ...spec, speed })} />
+         <details className="rounded-xl border border-ink-800 p-3 sm:p-4">
+           <summary className="cursor-pointer text-sm font-semibold">Personagens · {script.characters.length}</summary>
++          {project.series && <p className="mt-3 text-xs text-ink-500">As fichas visuais são compartilhadas pela série.</p>}
+           <div className="mt-3 grid gap-3">
+             {script.characters.map((character) => <CharacterCard key={character.id} project={project} character={character}
+               onChange={(updated) => onScript({ ...script, characters: script.characters.map((item) => item.id === updated.id ? updated : item) })} />)}
+           </div>
+         </details>
++        {project.visual_issues.length > 0 && <div className="rounded-lg border border-ink-800 bg-ink-850 p-3 text-sm" role="status">
++          <p className="font-semibold text-signal-bad">Revise as pendências visuais antes de produzir</p>
++          <ul className="mt-1 list-inside list-disc text-ink-400">
++            {project.visual_issues.map((item, index) => <li key={index}>{item}</li>)}
++          </ul>
++        </div>}
+         <div>
+           <h3 className="text-sm font-bold">Cenas</h3>
+           <div className="mt-2 flex flex-wrap gap-2">
+diff --git a/frontend/src/pages/story/Episode.tsx b/frontend/src/pages/story/Episode.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/pages/story/Episode.tsx
+@@ -0,0 +1,100 @@
++import { useEffect, useState } from 'react'
++
++import { SETTINGS, type EpisodeNotes, type StoryProject } from '../../stories'
++import { Select } from './Editor'
++
++const choiceFields = ['question', 'plan_a', 'plan_b'] as const
++const recapFields = { summary: 'Resumo do episódio', events: 'Acontecimentos importantes', mysteries: 'Mistérios em aberto' } as const
++const ballotLabels = { question: 'Pergunta ao público', plan_a: 'Plano A', plan_b: 'Plano B' }
++
++export function Episode({ project, busy, dirty, onSave, onStart, onContinue }: {
++  project: StoryProject
++  busy: boolean
++  dirty: boolean
++  onSave: (notes: EpisodeNotes) => void
++  onStart: (title: string) => void
++  onContinue: (idea: string) => void
++}) {
++  const [notes, setNotes] = useState(project.notes)
++  const [title, setTitle] = useState('')
++  const [idea, setIdea] = useState('')
++  const series = project.series
++  const previous = series?.previous
++  const stored = JSON.stringify(project.notes)
++  const changed = JSON.stringify(notes) !== stored
++  const changedChoices = choiceFields.some((key) => project.notes[key] !== notes[key])
++  const hasVote = !!project.notes.vote || !project.notes.question
++  const choices = choiceFields.filter((key) => notes[key].trim()).length
++  const approved = project.approved && !dirty
++  const locked = !!series && !series.latest
++  useEffect(() => { setNotes(JSON.parse(stored) as EpisodeNotes) }, [stored])
++
++  return (
++    <section className="panel p-4 sm:p-5" aria-labelledby="episode-title">
++      <h2 className="panel-title" id="episode-title">{series?.title ?? 'Série e final interativo'}</h2>
++      {series && <p className="mt-1 text-sm font-semibold text-ink-500">Episódio {series.number}</p>}
++      {previous && <details className="mt-3 rounded-lg border border-ink-800 p-3 text-sm">
++        <summary className="cursor-pointer font-semibold">De onde o episódio continua</summary>
++        <p className="mt-2 break-words font-semibold">{previous.title}</p>
++        <p className="mt-1 whitespace-pre-wrap break-words">{previous.summary}</p>
++        {previous.events && <p className="mt-2 break-words"><strong>Acontecimentos · </strong>{previous.events}</p>}
++        {previous.mysteries && <p className="mt-2 break-words"><strong>Mistérios · </strong>{previous.mysteries}</p>}
++        <p className="mt-2 break-words"><strong>Cenários · </strong>{previous.settings.map((setting) => SETTINGS[setting]).join(', ')}</p>
++        <p className="mt-2 break-words"><strong>Final · </strong>{previous.ending}</p>
++        {previous.chosen_plan && <p className="mt-2 break-words"><strong>Escolha registrada · </strong>{previous.chosen_plan}</p>}
++      </details>}
++      <fieldset disabled={busy} className="mt-3 grid min-w-0 gap-3">
++        <details className="rounded-lg border border-ink-800 p-3 text-sm">
++          <summary className="cursor-pointer font-semibold">Notas e final interativo</summary>
++          <div className="mt-3 grid gap-3">
++            {(Object.entries(recapFields) as [keyof typeof recapFields, string][]).map(([key, label]) => (
++              <label key={key} className="grid gap-1.5 font-semibold">
++                {label}
++                <textarea className="field min-h-14 resize-y font-normal" maxLength={400} value={notes[key]}
++                  placeholder={key === 'summary' ? project.script?.synopsis : undefined}
++                  onChange={(e) => setNotes({ ...notes, [key]: e.target.value })} />
++              </label>
++            ))}
++            {choiceFields.map((key) => <label key={key} className="grid gap-1.5 font-semibold">
++              {ballotLabels[key]}
++              <input className="field font-normal" maxLength={key === 'question' ? 72 : 80}
++                value={notes[key]} disabled={locked}
++                onChange={(e) => setNotes({ ...notes, [key]: e.target.value, vote: null })} />
++            </label>)}
++            <Select label="Resultado informado manualmente" value={notes.vote ?? 'pendente'}
++              values={{ pendente: 'Aguardando resultado', a: 'Plano A venceu', b: 'Plano B venceu' }}
++              disabled={locked || !project.notes.question || changedChoices}
++              onChange={(vote) => setNotes({ ...notes, vote: vote === 'pendente' ? null : vote })} />
++            {choices > 0 && choices < 3 && <p className="text-ink-500">Preencha a pergunta e os dois planos.</p>}
++            {locked && <p className="text-ink-500">O episódio seguinte já usa este final.</p>}
++            <button type="button" className="btn btn-ghost justify-self-start" disabled={!changed || choices === 1 || choices === 2}
++              onClick={() => onSave(notes)}>Salvar detalhes do episódio</button>
++          </div>
++        </details>
++        {series ? series.latest && (
++          <div className="grid gap-2">
++            <label className="grid gap-1.5 text-sm font-semibold">
++              Ideia para o próximo episódio (opcional)
++              <textarea className="field min-h-16 resize-y font-normal" maxLength={1200} value={idea}
++                onChange={(e) => setIdea(e.target.value)} />
++            </label>
++            {!hasVote && <p className="text-xs text-ink-500">Registre o resultado da votação para continuar.</p>}
++            <button type="button" className="btn btn-ghost justify-self-start"
++              disabled={!approved || !hasVote || changed || (idea.trim().length > 0 && idea.trim().length < 4)}
++              onClick={() => onContinue(idea)}>Criar episódio seguinte</button>
++          </div>
++        ) : (
++          <div className="grid gap-2">
++            <label className="grid gap-1.5 text-sm font-semibold">
++              Nome da série
++              <input className="field font-normal" maxLength={100} value={title} onChange={(e) => setTitle(e.target.value)} />
++            </label>
++            <button type="button" className="btn btn-ghost justify-self-start" disabled={!approved || !title.trim() || changed}
++              onClick={() => onStart(title)}>Iniciar série com esta história</button>
++            {!approved && <p className="text-xs text-ink-500">Aprove o roteiro para usar este elenco na série.</p>}
++          </div>
++        )}
++      </fieldset>
++    </section>
++  )
++}
+diff --git a/frontend/src/stories.ts b/frontend/src/stories.ts
+--- a/frontend/src/stories.ts
++++ b/frontend/src/stories.ts
+@@ -4,13 +4,18 @@
+   misterio: 'Mistério', terror: 'Terror leve', suspense: 'Suspense', humor: 'Humor absurdo',
+   reviravolta: 'Reviravolta', aventura: 'Aventura',
+ }
+-export const SPECIES = { cachorro: 'Cachorro', gato: 'Gato', coelho: 'Coelho', coruja: 'Coruja', robo: 'Robô' }
++export const SPECIES = { cachorro: 'Cachorro', gato: 'Gato', coelho: 'Coelho', coruja: 'Coruja', robo: 'Robô',
++  estrela: 'Estrela com rosto', pendente: 'Modelo pendente' }
+ export const SETTINGS = { quarto: 'Quarto', bosque: 'Bosque', jardim: 'Jardim', oficina: 'Oficina', rua: 'Rua' }
+ export const LIGHT = { dia: 'Dia', entardecer: 'Entardecer', noite: 'Noite' }
+ export const MOODS = { calmo: 'Calma', feliz: 'Alegria', surpreso: 'Surpresa', assustado: 'Medo', curioso: 'Curiosidade', triste: 'Tristeza' }
+-export const MOTIONS = { respirar: 'Respirar e piscar', acenar: 'Acenar', balancar_cabeca: 'Balançar a cabeça', entrar: 'Entrar em cena', sair: 'Sair de cena', pular: 'Pular' }
++export const MOTIONS = { respirar: 'Respirar e piscar', acenar: 'Acenar', balancar_cabeca: 'Balançar a cabeça',
++  entrar: 'Entrar em cena', sair: 'Sair de cena', pular: 'Pular', caminhar: 'Caminhar', observar: 'Observar' }
+ export const PROPS = { nenhum: 'Nenhum', estrela: 'Estrela', chave: 'Chave', bilhete: 'Bilhete', lanterna: 'Lanterna', livro: 'Livro', semente: 'Semente', bola: 'Bola' }
+-export const SHOTS = { medio: 'Plano médio', proximo: 'Plano mais próximo' }
++export const SHOTS = { medio: 'Plano médio', proximo: 'Plano mais próximo', aberto: 'Plano aberto', acompanhar: 'Acompanhar movimento' }
++export const STYLES = { 'cartoon-3d': 'Cartoon 3D', 'cartoon-2d': 'Cartoon 2D' }
++export const POSITIONS = { esquerda: 'Esquerda', centro: 'Centro', direita: 'Direita' }
++export const GAZES = { camera: 'Câmera', outro: 'Outro personagem', objeto: 'Objeto', janela: 'Janela' }
+ export const ACCESSORIES = { nenhum: 'Nenhum', lenco: 'Lenço', gravata: 'Gravata', oculos: 'Óculos', broche: 'Broche' }
+ export const DURATION = [15, 30, 45, 60] as const
+ 
+@@ -19,7 +24,7 @@
+   genre: keyof typeof GENRES
+   seconds: typeof DURATION[number]
+   model: string
+-  style: 'cartoon-2d'
++  style: keyof typeof STYLES
+   language: 'pt-BR'
+   voice: string
+   speed: number
+@@ -45,9 +50,18 @@
+   action: string
+   mood: keyof typeof MOODS
+   motion: keyof typeof MOTIONS
++  motion_character: string | null
+   prop: keyof typeof PROPS
+   shot: keyof typeof SHOTS
+   seconds: number
++  placements: Placement[]
++  missing_assets: string[]
++}
++
++export interface Placement {
++  character: string
++  position: keyof typeof POSITIONS
++  gaze: keyof typeof GAZES
+ }
+ 
+ export interface Script {
+@@ -68,6 +82,7 @@
+   duration: number
+   size_bytes: number
+   created_at: string
++  style: StorySpec['style']
+ }
+ 
+ export const STATUS = {
+@@ -75,9 +90,9 @@
+   falhou: 'Falhou', cancelado: 'Cancelado', interrompido: 'Interrompido',
+ }
+ export const STAGES = {
+-  roteiro: 'Gerando roteiro', personagens: 'Preparando personagens', cenarios: 'Preparando cenários',
+-  narracao: 'Gerando narração', animacao: 'Animando cenas', legendas: 'Inserindo legendas',
+-  renderizacao: 'Renderizando vídeo', finalizado: 'Finalizado',
++  roteiro: 'Gerando roteiro', modelos: 'Preparando modelos e cenários',
++  narracao: 'Gerando narração', animacao: 'Preparando animações', quadros: 'Renderizando quadros',
++  legendas: 'Sincronizando legendas', codificacao: 'Codificando vídeo', finalizado: 'Finalizado',
+ }
+ 
+ export interface StorySummary {
+@@ -85,6 +100,34 @@
+   status: keyof typeof STATUS
+   title: string
+   updated_at: string
++  series_title: string | null
++  episode_number: number | null
++}
++
++export interface EpisodeNotes {
++  summary: string
++  events: string
++  mysteries: string
++  question: string
++  plan_a: string
++  plan_b: string
++  vote: 'a' | 'b' | null
++}
++
++export interface StorySeries {
++  id: string
++  title: string
++  number: number
++  latest: boolean
++  previous: {
++    title: string
++    summary: string
++    events: string
++    mysteries: string
++    settings: (keyof typeof SETTINGS)[]
++    ending: string
++    chosen_plan: string
++  } | null
+ }
+ 
+ interface Task {
+@@ -93,7 +136,7 @@
+   refresh?: boolean
+ }
+ 
+-export interface StoryProject extends Omit<StorySummary, 'title'> {
++export interface StoryProject extends Omit<StorySummary, 'title' | 'series_title' | 'episode_number'> {
+   spec: StorySpec
+   script: Script | null
+   approved: boolean
+@@ -104,14 +147,20 @@
+   error: string | null
+   task: Task | null
+   audio_id: string | null
++  audio_voice: string | null
++  visual_issues: string[]
+   export: StoryExport | null
++  notes: EpisodeNotes
++  series: StorySeries | null
+ }
+ 
+ export interface StoryOptions {
+   models: string[]
+   ollama_problem: string | null
+   voices: string[]
++  voice_profiles: { id: string; name: string; engine: 'Kokoro' | 'Piper' }[]
+   piper_installed: boolean
++  renderer_3d: boolean
+   width: number
+   height: number
+   word_captions: boolean
+@@ -126,6 +175,8 @@
+ const exportPath = (id: string) => '/exports/' + encodeURIComponent(id)
+ 
+ export function voiceName(voice: string) {
++  const kokoro: Record<string, string> = { pf_dora: 'Dora', pm_alex: 'Alex', pm_santa: 'Santa' }
++  if (kokoro[voice]) return kokoro[voice] + ' · Kokoro'
+   const [name] = voice.replace(/^pt_BR-/, '').split('-')
+   return name ? name[0].toUpperCase() + name.slice(1) + ' · pt-BR' : 'Sem voz'
+ }
+@@ -137,13 +188,18 @@
+   create: (spec: StorySpec) => write<StoryProject>('', 'POST', spec),
+   save: (id: string, spec: StorySpec, script: Script) => write<StoryProject>(projectPath(id), 'PUT', { spec, script }),
+   approve: (id: string) => write<StoryProject>(projectPath(id) + '/approve', 'POST'),
++  saveEpisode: (id: string, notes: EpisodeNotes) => write<StoryProject>(projectPath(id) + '/episode', 'PUT', notes),
++  startSeries: (id: string, title: string) => write<StoryProject>(projectPath(id) + '/series', 'POST', { title }),
++  continueSeries: (id: string, idea: string) => write<StoryProject>(projectPath(id) + '/continuation', 'POST', { idea }),
+   task: (id: string, task: Task) => write<StoryProject>(projectPath(id) + '/tasks', 'POST', task),
+   resume: (id: string) => write<StoryProject>(projectPath(id) + '/resume', 'POST'),
+   cancel: (id: string) => write<void>(projectPath(id) + '/cancel', 'POST'),
++  previewVoice: (voice: string, speed: number) => write<{ id: string }>('/voice-previews', 'POST', { voice, speed }),
++  sample: (id: string) => prefix + '/voice-previews/' + encodeURIComponent(id),
+   video: (id: string, download = false) => prefix + exportPath(id) + '/video' + (download ? '?download=true' : ''),
+   captions: (id: string) => prefix + exportPath(id) + '/captions',
+   audio: (id: string, version: string) => prefix + projectPath(id) + '/audio/' + encodeURIComponent(version),
+   reference: (id: string, key: string, version: string) => prefix + projectPath(id) + '/characters/'
+     + encodeURIComponent(key) + '?v=' + encodeURIComponent(version),
+-  stylePreview: prefix + '/style-preview',
+-}
++  stylePreview: (style: StorySpec['style']) => prefix + '/style-preview?style=' + style,
++}
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -50,6 +50,7 @@
+   # made the diarization extra unsatisfiable, since WhisperX requires >=2.1.
+   "numpy>=1.26",
+   "pillow>=10.4",
++  "moderngl>=5.12,<6",
+   # Captions
+   "pysubs2>=1.7",
+   # Providers
+diff --git a/tests/test_studio_stories.py b/tests/test_studio_stories.py
+--- a/tests/test_studio_stories.py
++++ b/tests/test_studio_stories.py
+@@ -3,6 +3,7 @@
+ import asyncio
+ import json
+ import shutil
++import sqlite3
+ import threading
+ import time
+ import wave
+@@ -11,8 +12,8 @@
+ from autoclip import paths
+ from autoclip.app import create_app
+ from autoclip.pipeline import Cancelled, ffmpeg
+-from autoclip.stories import art, narration, writer
+-from autoclip.stories.schema import Script, StoryError, StorySpec, StoryTask
++from autoclip.stories import art, cartoon3d, narration, render, writer
++from autoclip.stories.schema import EpisodeNotes, Script, StoryError, StorySpec, StoryTask
+ from autoclip.stories.store import StoryStore
+ from fastapi.testclient import TestClient
+ from PIL import Image, ImageChops
+@@ -26,7 +27,9 @@
+ 
+ @pytest.fixture
+ def spec() -> StorySpec:
+-    return StorySpec(idea="Uma coruja ajuda um robô a devolver uma estrela.", voice=VOICE)
++    return StorySpec(
++        idea="Uma coruja ajuda um robô a devolver uma estrela.", voice=VOICE, style="cartoon-2d"
++    )
+ 
+ 
+ @pytest.fixture
+@@ -203,6 +206,150 @@
+     assert art.reference(tmp_path, second) == previous_reference
+ 
+ 
++def test_visual_issues_are_editable_and_the_correct_actor_moves(client, script):
++    spec = StorySpec(idea="Dois amigos esperam no jardim.")
++    scene = script.scenes[0]
++    scene.motion = "entrar"
++    scene.motion_character = scene.characters[1]
++    placements = [
++        {"character": identity, "position": "centro", "gaze": "outro"}
++        for identity in scene.characters
++    ]
++    scene = type(scene).model_validate(scene.model_dump() | {"placements": placements})
++    script.scenes[0] = scene
++    url = project(client, spec, script)
++    assert client.get(url).json()["spec"]["style"] == "cartoon-3d"
++    assert "Escolha posições diferentes" in client.get(url).json()["visual_issues"][0]
++    post(client, url + "/approve")
++    post(client, url + "/tasks", {"kind": "render"}, expected=422)
++    scene.placements[0].position = "esquerda"
++    scene.placements[1].position = "direita"
++    assert not script.visual_issues()
++    assert cartoon3d._pose(scene, 0, 0, 5, -0.6).position == -0.6
++    assert cartoon3d._pose(scene, 1, 0, 5, 0.6).position > 0.6
++    assert cartoon3d._pose(scene, 1, 1.5, 5, 0.6).position == 0.6
++
++
++def test_migrates_legacy_projects_with_2d_export(tmp_path, spec, script):
++    store = StoryStore(tmp_path)
++    store.initialize()
++    p = store.create(spec)["id"]
++    store.save(p, spec, script)
++    store.approve(p)
++    active = store.begin(p, StoryTask(kind="render"))
++    store.end(p, active["run_id"], "finalizado", exported=(script.title, 720, 1280, 15, 32))
++    with sqlite3.connect(store.database) as connection:
++        connection.execute("ALTER TABLE projects DROP COLUMN notes")
++        connection.execute("ALTER TABLE exports DROP COLUMN style")
++        legacy_spec = spec.model_dump(exclude={"style"})
++        connection.execute("UPDATE projects SET spec=? WHERE id=?", (json.dumps(legacy_spec), p))
++    store.initialize()
++    after = store.get(p)
++    assert after["spec"]["style"] == "cartoon-2d"
++    assert after["export"]["style"] == "cartoon-2d"
++    assert after["export"]["id"] == active["run_id"] and after["approved"]
++    assert Script.model_validate(after["script"]) == script
++    assert after["series"] is None and after["notes"] == EpisodeNotes().model_dump()
++
++
++def save_notes(client, url, notes, expected=200):
++    response = client.put(url + "/episode", json=notes.model_dump(), headers=LOCAL)
++    assert response.status_code == expected, response.text
++    return response.json()
++
++
++def test_series_requires_manual_vote_and_reuses_cast(client, monkeypatch, spec, script):
++    url = project(client, spec, script)
++    post(client, url + "/approve")
++    first = post(client, url + "/series", {"title": "Lume e Nina"}, expected=201)
++    assert first["series"]["number"] == 1
++    notes = EpisodeNotes(
++        question="Para onde eles vão?",
++        plan_a="Voltar para casa.",
++        plan_b="Seguir as pegadas.",
++        mysteries="Quem deixou a carta?",
++    )
++    save_notes(client, url, notes)
++    post(client, url + "/continuation", {}, expected=422)
++    save_notes(client, url, notes.model_copy(update={"vote": "b"}))
++    second = post(client, url + "/continuation", {}, expected=201)
++    assert second["series"]["number"] == 2 and second["series"]["id"] == first["series"]["id"]
++    previous = second["series"]["previous"]
++    assert previous["chosen_plan"] == notes.plan_b and previous["ending"] == script.ending
++    assert previous["mysteries"] == notes.mysteries and previous["settings"] == ["jardim"]
++    assert second["script"] is None and second["notes"]["vote"] is None
++    post(client, url + "/continuation", {}, expected=422)
++    save_notes(client, url, notes.model_copy(update={"vote": "a"}), expected=422)
++
++    changed = script.model_dump()
++    changed["title"] = "O caminho na mata"
++    changed["characters"][0]["color"] = "#ffffff"
++    changed["characters"][1]["species"] = "gato"
++    for scene in changed["scenes"]:
++        scene["id"] = "s1"
++
++    async def generate(_url, payload, _cancelled):
++        assert notes.plan_b in payload["prompt"] and notes.plan_a not in payload["prompt"]
++        assert notes.mysteries in payload["prompt"] and script.ending in payload["prompt"]
++        return json.dumps(changed)
++
++    monkeypatch.setattr(writer, "_generation", generate)
++    next_url = PREFIX + "/" + second["id"]
++    post(client, next_url + "/tasks", {"kind": "roteiro"}, expected=202)
++    continued = wait_for(client, next_url, "rascunho")
++    assert continued["script"]["title"] == changed["title"]
++    assert [scene["id"] for scene in continued["script"]["scenes"]] == ["s1", "s2", "s3"]
++    assert continued["script"]["characters"] == [item.model_dump() for item in script.characters]
++    for edit in (
++        {
++            "script": continued["script"] | {"characters": changed["characters"]},
++            "spec": spec.model_dump(),
++        },
++        {"script": continued["script"], "spec": spec.model_dump() | {"style": "cartoon-3d"}},
++    ):
++        assert client.put(next_url, json=edit, headers=LOCAL).status_code == 422
++
++
++def test_interactive_overlay_has_both_plans_and_silence(tmp_path, script, spec, fake_piper):
++    notes = EpisodeNotes(
++        question="O que Pingo deve fazer?", plan_a="Abrir a porta.", plan_b="Seguir as pegadas."
++    )
++    output = tmp_path / "episode"
++    output.mkdir()
++    timeline = narration.make_narration(
++        script,
++        spec,
++        fake_piper[0],
++        tmp_path / "audio",
++        output,
++        lambda: False,
++        lambda *_: None,
++        reserve_end=notes.end_seconds,
++    )
++    assert timeline.ballot_start == spec.seconds - notes.end_seconds
++    assert timeline.cues[-1].end < timeline.ballot_start
++    with wave.open(str(output / "narracao.wav"), "rb") as audio:
++        assert audio.getnframes() == spec.seconds * audio.getframerate()
++        audio.setpos(round(timeline.ballot_start * audio.getframerate()))
++        assert not any(audio.readframes(audio.getnframes()))
++
++    def solid(*_args):
++        return Image.new("RGB", (720, 1280), "#202030")
++
++    card = render._ballot(notes)
++    assert (
++        ImageChops.difference(card, render._ballot(notes.model_copy(update={"vote": "a"}))).getbbox(
++            alpha_only=False
++        )
++        is None
++    )
++    render._write_frames(solid, timeline, output, 15, 1, lambda: False, lambda *_: None, card)
++    with Image.open(output / f"{int(timeline.ballot_start) - 1:05d}.png") as earlier:
++        assert earlier.getpixel((120, 370)) == (32, 32, 48)
++    with Image.open(output / "00014.png") as last:
++        assert last.getpixel((120, 370)) != (32, 32, 48)
++
++
+ def test_narration_uses_pcm_times_and_reuses_audio(tmp_path, script, spec, fake_piper):
+     voice, calls = fake_piper
+     track = tmp_path / "track"
+@@ -232,6 +379,34 @@
+     failed = wait_for(client, url, "falhou")
+     assert failed["export"] is None and failed["stage"] == "narracao"
+     assert "preparar-voz-historias.ps1" in failed["error"]
++
++
++def test_voice_comparison_and_fallback_preserve_story(client, spec, script, fake_piper):
++    assert client.post(PREFIX + "/voice-previews", json={"voice": VOICE}).status_code == 403
++    preview = post(client, PREFIX + "/voice-previews", {"voice": VOICE, "speed": 1.05})
++    sample = client.get(PREFIX + "/voice-previews/" + preview["id"])
++    assert sample.headers["content-type"] == "audio/wav" and sample.content.startswith(b"RIFF")
++    post(client, PREFIX + "/voice-previews", {"voice": "pf_dora"}, expected=422)
++    url = project(client, spec, script)
++    post(client, url + "/approve")
++    post(client, url + "/tasks", {"kind": "audio"}, expected=202)
++    original = wait_for(client, url, "rascunho")
++    assert original["audio_voice"] == VOICE
++    changed = spec.model_copy(update={"voice": "pf_dora", "speed": 0.9})
++    response = client.put(
++        url,
++        json={"script": script.model_dump(), "spec": changed.model_dump()},
++        headers=LOCAL,
++    )
++    assert response.status_code == 200
++    edited = response.json()
++    assert edited["approved"] and edited["audio_id"] is None
++    assert edited["script"] == original["script"]
++    post(client, url + "/tasks", {"kind": "audio"}, expected=202)
++    fallback = wait_for(client, url, "rascunho")
++    assert fallback["audio_voice"] == VOICE and fallback["spec"]["voice"] == "pf_dora"
++    assert fallback["audio_id"] != original["audio_id"]
++    assert fake_piper[1][-1][0] == 0.9
+ 
+ 
+ def test_single_story_and_cancel_resume(client, monkeypatch, spec, script):
